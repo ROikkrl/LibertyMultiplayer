@@ -38,7 +38,8 @@ public sealed class LibertyFriends : Script
     {
         public uint Colors, Horn;
         public int Flags, Station = -1;
-        public long LastHorn;
+        public long LastHorn, MotionAt, MotionSample = -1, NextPhysics;
+        public float ForwardSpeed, VerticalSpeed;
     }
 
     private sealed class AvatarGait
@@ -123,6 +124,7 @@ public sealed class LibertyFriends : Script
     private long resumeSample;
     private string ride = "-";
     private Vehicle drivingCar;
+    private Vehicle trackedPlayerCar;
     private int drivingToken;
     private long nextWorldSample;
     private long worldSampleAt;
@@ -130,9 +132,17 @@ public sealed class LibertyFriends : Script
     private string worldSample = "-";
     private string worldOwner;
     private string sharedSource;
+    private string globalWorldHost;
     private long lastSharedFrame, lastSharedAt, lastAmbientAt, nextSharedCapture, nextSharedSpawn, nextAmbientCleanup;
     private int episode = -1;
     private bool suppressingPopulation, remoteAmbientConfirmed;
+    private string pendingTake;
+    private long takeUntil;
+    private bool takeMounted;
+    private Vehicle acquiredTraffic;
+    private string acquiredTrafficKey;
+    private readonly Dictionary<string, Vehicle> sourceTraffic = new Dictionary<string, Vehicle>();
+    private readonly Dictionary<string, long> delegatedTraffic = new Dictionary<string, long>();
     private bool hornHeld, hornWasPressed;
     private uint hornSequence;
     private readonly Dictionary<string, Ped> worldPeds = new Dictionary<string, Ped>();
@@ -258,6 +268,7 @@ public sealed class LibertyFriends : Script
         reportedPeers = false;
         worldOwner = null;
         sharedSource = null;
+        globalWorldHost = null;
         lastSharedFrame = 0;
         nextSharedCapture = 0;
         remoteAmbientConfirmed = false;
@@ -265,6 +276,11 @@ public sealed class LibertyFriends : Script
         episode = -1;
         SetPopulationSuppressed(false);
         drivingCar = null;
+        trackedPlayerCar = null;
+        pendingTake = null;
+        acquiredTrafficKey = null;
+        sourceTraffic.Clear();
+        delegatedTraffic.Clear();
         hornHeld = false;
         hornWasPressed = false;
         tunedRide = "-";
@@ -320,6 +336,7 @@ public sealed class LibertyFriends : Script
                 if (driving && !Equals(drivingCar, car))
                 {
                     drivingCar = car;
+                    trackedPlayerCar = car;
                     drivingToken++;
                     nextRadioSample = 0;
                     hornSequence = 0;
@@ -397,7 +414,7 @@ public sealed class LibertyFriends : Script
             ResetConnection();
             Trace("server timed out; remote entities removed");
         }
-        if (sharedSource != null && now - lastSharedAt > 1200)
+        if (sharedSource != null && now - lastSharedAt > 3000)
         {
             sharedSource = null;
             SetPopulationSuppressed(false);
@@ -693,13 +710,14 @@ public sealed class LibertyFriends : Script
     private bool CanPublishCar(Vehicle car, Vehicle localCar)
     {
         return Exists(car) && !Equals(car, localCar) && !car.isRequiredForMission && car.isAlive &&
+            (!Equals(car, trackedPlayerCar) || SquaredDistance(Player.Character.Position, car.Position) > 10000f) &&
             !cars.ContainsValue(car) && !worldCars.ContainsValue(car);
     }
 
-    private static string WorldRow(string kind, int id, int model, Vector3 p, float heading)
+    private static string WorldRow(string kind, int id, int model, Vector3 p, float heading, int scale = 10)
     {
         return string.Format(CultureInfo.InvariantCulture, "{0},{1},{2},{3},{4},{5},{6}", kind, id, model,
-            (int)Math.Round(p.X * 10), (int)Math.Round(p.Y * 10), (int)Math.Round(p.Z * 10),
+            (int)Math.Round(p.X * scale), (int)Math.Round(p.Y * scale), (int)Math.Round(p.Z * scale),
             (int)((heading % 360 + 360) % 360));
     }
 
@@ -707,21 +725,52 @@ public sealed class LibertyFriends : Script
     {
         if (episode < 0) episode = GTA.Native.Function.Call<int>("GET_CURRENT_EPISODE");
         var frame = new StringBuilder();
+        int remaining = 29;
         frame.AppendFormat(CultureInfo.InvariantCulture, "{0} {1} {2}\n", ownId, sample, episode);
-        if (driving)
-            frame.Append(CaptureVehicleDetails("d", drivingToken, localCar, sourceStation,
-                hornHeld, hornSequence, 0)).Append('\n');
+        if (pendingTake != null && sample >= takeUntil)
+        {
+            if (!takeMounted) Game.DisplayText("Vehicle unavailable");
+            pendingTake = null;
+        }
+        if (pendingTake != null)
+        {
+            string[] take = pendingTake.Split(':');
+            frame.AppendFormat(CultureInfo.InvariantCulture, "t,{0},{1},{2},{3}\n",
+                take[0], take[2], take[3], takeMounted ? 1 : 0);
+        }
+        Vehicle playerCar = driving ? localCar : trackedPlayerCar;
+        if (Exists(playerCar) && SquaredDistance(local.Position, playerCar.Position) <= 10000f)
+        {
+            frame.Append(CaptureVehicleDetails("d", drivingToken, playerCar, sourceStation,
+                driving && hornHeld, hornSequence, 0)).Append('\n');
+            remaining--;
+        }
+        foreach (var entry in delegatedTraffic)
+        {
+            Vehicle car;
+            if (sample - entry.Value > 1200 || !worldCars.TryGetValue(entry.Key, out car) || !Exists(car) ||
+                SquaredDistance(local.Position, car.Position) > 115f * 115f) continue;
+            string[] key = entry.Key.Split(':');
+            Ped driver = car.GetPedOnSeat(VehicleSeat.Driver);
+            int driverModel = Exists(driver) ? driver.Model.Hash : 0;
+            frame.Append(CaptureVehicleDetails("m", int.Parse(key[2], CultureInfo.InvariantCulture),
+                car, -1, false, 0, driverModel)).Append(',').Append(key[0]).Append('\n');
+            if (--remaining == 0) break;
+        }
         if (sharedSource == ownId)
         {
+            foreach (string key in new List<string>(sourceTraffic.Keys))
+                if (!Exists(sourceTraffic[key])) sourceTraffic.Remove(key);
             Vector3 origin = local.Position;
             var nearbyCars = new List<KeyValuePair<float, Vehicle>>();
             foreach (Vehicle car in World.GetVehicles(origin, 145f))
                 if (CanPublishCar(car, localCar))
                     nearbyCars.Add(new KeyValuePair<float, Vehicle>(SquaredDistance(origin, car.Position), car));
             nearbyCars.Sort((a, b) => a.Key.CompareTo(b.Key));
-            for (int i = 0; i < Math.Min(10, nearbyCars.Count); i++)
+            for (int i = 0; i < Math.Min(10, nearbyCars.Count) && remaining > 0; i++, remaining--)
             {
                 Vehicle car = nearbyCars[i].Value;
+                sourceTraffic[TrafficKey(ownId, car.GetHashCode(), car.Model.Hash)] = car;
                 Ped driver = car.GetPedOnSeat(VehicleSeat.Driver);
                 int driverModel = Exists(driver) && !avatars.ContainsValue(driver) ? driver.Model.Hash : 0;
                 frame.Append(CaptureVehicleDetails("v", car.GetHashCode(), car, -1, false, 0, driverModel)).Append('\n');
@@ -732,7 +781,7 @@ public sealed class LibertyFriends : Script
                 if (CanPublishPed(ped, local) && !worldDrivers.ContainsValue(ped))
                     nearbyPeds.Add(new KeyValuePair<float, Ped>(SquaredDistance(origin, ped.Position), ped));
             nearbyPeds.Sort((a, b) => a.Key.CompareTo(b.Key));
-            for (int i = 0; i < Math.Min(17, nearbyPeds.Count); i++)
+            for (int i = 0; i < Math.Min(17, nearbyPeds.Count) && remaining > 0; i++, remaining--)
             {
                 Ped ped = nearbyPeds[i].Value;
                 Vector3 velocity = ped.Velocity;
@@ -760,17 +809,22 @@ public sealed class LibertyFriends : Script
     {
         Model model = car.Model;
         Quaternion q = car.RotationQuaternion;
+        Vector3 velocity = ReadVehicleVelocity(car);
+        Vector3 direction = car.Direction;
+        float forward = velocity.X * direction.X + velocity.Y * direction.Y;
         uint colors = (uint)(car.Color.Index & 255) | ((uint)(car.FeatureColor1.Index & 255) << 8) |
             ((uint)(car.SpecularColor.Index & 255) << 16) | ((uint)(car.FeatureColor2.Index & 255) << 24);
         int flags = (car.EngineRunning ? 1 : 0) | (car.SirenActive ? 2 : 0) |
             ((model.isCar || model.isBike) && car.LightsOn ? 4 : 0) | (horn ? 8 : 0);
-        return WorldRow(kind, id, model.Hash, car.Position, car.Heading) +
-            string.Format(CultureInfo.InvariantCulture, ",{0},{1},{2},{3},{4},{5},{6},{7},{8},{9},{10},{11},{12}",
+        return WorldRow(kind, id, model.Hash, car.Position, car.Heading, 100) +
+            string.Format(CultureInfo.InvariantCulture, ",{0},{1},{2},{3},{4},{5},{6},{7},{8},{9},{10},{11},{12},{13},{14}",
                 (int)Math.Round(q.X * 1000), (int)Math.Round(q.Y * 1000), (int)Math.Round(q.Z * 1000),
                 (int)Math.Round(q.W * 1000), colors, flags, hornNumber, station, driverModel,
                 (int)Math.Max(-4000, Math.Min(1000, car.EngineHealth)),
                 Math.Max(0, Math.Min(1000, car.Health)),
-                (int)Math.Max(-4000, Math.Min(1000, car.PetrolTankHealth)), TireMask(car));
+                (int)Math.Max(-4000, Math.Min(1000, car.PetrolTankHealth)), TireMask(car),
+                (int)Math.Round(100 * Math.Max(-150, Math.Min(150, forward))),
+                (int)Math.Round(100 * Math.Max(-60, Math.Min(60, velocity.Z))));
     }
 
     private void SetPopulationSuppressed(bool value)
@@ -807,6 +861,7 @@ public sealed class LibertyFriends : Script
         protectedCars.UnionWith(worldCars.Values);
         protectedCars.Add(character.CurrentVehicle);
         protectedCars.Add(Player.LastVehicle);
+        protectedCars.Add(acquiredTraffic);
 
         Group group = Player.Group;
         bool hasGroup = Exists(group);
@@ -866,7 +921,6 @@ public sealed class LibertyFriends : Script
         string source = header[4];
         if (sharedSource != source)
         {
-            UpdateWorld(null);
             sharedSource = source;
             lastAmbientAt = 0;
             nextSharedCapture = 0;
@@ -879,31 +933,50 @@ public sealed class LibertyFriends : Script
             string[] parts = lines[i].Split(' ');
             long entitySample;
             if (parts.Length != 3 || parts[0].Length != 16 || !long.TryParse(parts[1], out entitySample)) continue;
+            if (parts[2] == "#")
+            {
+                if (globalWorldHost != parts[0])
+                {
+                    globalWorldHost = parts[0];
+                    Trace("global world host=" + globalWorldHost);
+                }
+                continue;
+            }
             if (parts[2] == "@" && parts[0] == source && source != ownId)
             {
                 hasAmbientFrame = true;
                 continue;
             }
             string[] fields = parts[2].Split(',');
-            if (fields.Length != 8 && fields.Length != 20) continue;
+            if (fields.Length != 3 && fields.Length != 8 && fields.Length != 22) continue;
             int id, model;
             if (!int.TryParse(fields[1], out id) || !int.TryParse(fields[2], out model)) continue;
             string kind = fields[0];
-            if (kind == "d" && fields.Length == 20)
+            if ((kind == "take" || kind == "drop" || kind == "hide") && fields.Length == 3)
             {
-                string carId = parts[0] + ":" + id.ToString(CultureInfo.InvariantCulture);
-                Vehicle remoteCar;
-                if (cars.TryGetValue(carId, out remoteCar) && Exists(remoteCar) && remoteCar.Model.Hash == model)
-                    ApplyVehicleDetails(carId, remoteCar, fields, now);
+                ApplyTrafficTransfer(kind, parts[0], id, model, character);
                 continue;
             }
-            if (parts[0] != source || source == ownId) continue;
+            if (kind == "d" && fields.Length == 22)
+            {
+                string carId = parts[0] + ":" + id.ToString(CultureInfo.InvariantCulture);
+                int cx, cy, cz, yaw;
+                if (int.TryParse(fields[3], out cx) && int.TryParse(fields[4], out cy) &&
+                    int.TryParse(fields[5], out cz) && int.TryParse(fields[6], out yaw))
+                    ApplySharedCar(carId, new Model(model), new Vector3(cx / 100f, cy / 100f, cz / 100f),
+                        yaw, fields, entitySample, now, true);
+                continue;
+            }
+            bool traffic = kind == "v" || kind == "m";
+            if (!traffic && (parts[0] != source || source == ownId)) continue;
             int x, y, z, heading;
             if (!int.TryParse(fields[3], out x) || !int.TryParse(fields[4], out y) ||
                 !int.TryParse(fields[5], out z) || !int.TryParse(fields[6], out heading)) continue;
-            var position = new Vector3(x / 10f, y / 10f, z / 10f);
-            if (SquaredDistance(character.Position, position) > 110f * 110f) continue;
-            string key = source + ":" + kind + ":" + fields[1] + ":" + fields[2];
+            float scale = traffic ? 100f : 10f;
+            var position = new Vector3(x / scale, y / scale, z / scale);
+            float radius = kind == "m" ? 120f : 110f;
+            if (SquaredDistance(character.Position, position) > radius * radius) continue;
+            string key = traffic ? TrafficKey(parts[0], id, model) : source + ":p:" + fields[1] + ":" + fields[2];
             if (kind == "p" && fields.Length == 8)
             {
                 int gait;
@@ -911,10 +984,10 @@ public sealed class LibertyFriends : Script
                 seen.Add(key);
                 ApplySharedPed(key, new Model(model), position, heading, gait, entitySample, now);
             }
-            else if (kind == "v" && fields.Length == 20)
+            else if (traffic && fields.Length == 22 && key != acquiredTrafficKey)
             {
                 seen.Add(key);
-                ApplySharedCar(key, new Model(model), position, heading, fields, entitySample, now);
+                ApplySharedCar(key, new Model(model), position, heading, fields, entitySample, now, false, kind == "m");
             }
         }
         remoteAmbientConfirmed = hasAmbientFrame;
@@ -922,7 +995,7 @@ public sealed class LibertyFriends : Script
         foreach (string key in new List<string>(worldPeds.Keys))
             if (CanCullWorld(key, seen, source != ownId, source, now)) RemoveWorldEntity(key);
         foreach (string key in new List<string>(worldCars.Keys))
-            if (CanCullWorld(key, seen, source != ownId, source, now)) RemoveWorldEntity(key);
+            if (!seen.Contains(key) && CanCullTraffic(key, character, now)) RemoveWorldEntity(key);
     }
 
     private bool CanSpawnWorldModel(Model model, long now)
@@ -935,6 +1008,76 @@ public sealed class LibertyFriends : Script
         if (now < nextSharedSpawn) return false;
         nextSharedSpawn = now + 45;
         return true;
+    }
+
+    private static string TrafficKey(string source, int handle, int model)
+    {
+        return string.Format(CultureInfo.InvariantCulture, "{0}:v:{1}:{2}", source, handle, model);
+    }
+
+    private void ApplyTrafficTransfer(string command, string source, int handle, int model, Ped character)
+    {
+        string key = TrafficKey(source, handle, model);
+        if (command == "hide" || command == "drop")
+        {
+            if (command == "drop" && pendingTake == key && takeMounted) pendingTake = null;
+            if (source == ownId)
+            {
+                Vehicle original;
+                if (sourceTraffic.TryGetValue(key, out original) && !worldCars.ContainsValue(original))
+                    DropSourceTraffic(key, original, character);
+            }
+            if (command == "drop" && worldCars.ContainsKey(key) && !Equals(worldCars[key], character.CurrentVehicle))
+                RemoveWorldEntity(key);
+            return;
+        }
+        if (pendingTake != key || takeMounted || clock.ElapsedMilliseconds >= takeUntil ||
+            !Player.CanControlCharacter || Exists(character.CurrentVehicle)) return;
+        Vehicle car;
+        if (!worldCars.TryGetValue(key, out car) || !Exists(car) ||
+            SquaredDistance(character.Position, car.Position) > 81f) return;
+        Ped driver;
+        if (worldDrivers.TryGetValue(key, out driver) && Exists(driver)) driver.Delete();
+        worldDrivers.Remove(key);
+        if (!car.isSeatFree(VehicleSeat.Driver)) return;
+        car.DoorLock = DoorLock.None;
+        character.WarpIntoVehicle(car, VehicleSeat.Driver);
+        if (!Equals(car.GetPedOnSeat(VehicleSeat.Driver), character)) return;
+        acquiredTraffic = car;
+        acquiredTrafficKey = key;
+        takeMounted = true;
+        worldCars.Remove(key);
+        delegatedTraffic.Remove(key);
+        worldTracks.Remove(key);
+        appliedDamage.Remove(key);
+        vehicleDetails.Remove(key);
+        Trace("took shared vehicle " + key);
+    }
+
+    private void DropSourceTraffic(string key, Vehicle car, Ped character)
+    {
+        if (!Exists(car))
+        {
+            sourceTraffic.Remove(key);
+            return;
+        }
+        if (car.isRequiredForMission || Equals(car, character.CurrentVehicle) ||
+            Equals(car, Player.LastVehicle) || cars.ContainsValue(car) || worldCars.ContainsValue(car)) return;
+        var occupants = new List<Ped>();
+        Group group = Player.Group;
+        for (int seat = -1; seat < car.PassengerSeats; seat++)
+        {
+            Ped ped = car.GetPedOnSeat((VehicleSeat)seat);
+            if (!Exists(ped)) continue;
+            if (Equals(ped, character) || ped.isRequiredForMission || avatars.ContainsValue(ped) ||
+                (Exists(group) && group.isMember(ped))) return;
+            occupants.Add(ped);
+        }
+        foreach (Ped ped in occupants)
+            if (Exists(ped)) ped.Delete();
+        car.Delete();
+        sourceTraffic.Remove(key);
+        Trace("released shared vehicle " + key);
     }
 
     private void ApplySharedPed(string key, Model model, Vector3 position, int heading, int gait, long sample, long now)
@@ -969,7 +1112,7 @@ public sealed class LibertyFriends : Script
     }
 
     private void ApplySharedCar(string key, Model model, Vector3 position, int heading, string[] fields,
-        long sample, long now)
+        long sample, long now, bool playerVehicle = false, bool simulate = false)
     {
         if (!model.isVehicle) return;
         int qx, qy, qz, qw, driver, engine, body, tank, tires;
@@ -982,23 +1125,52 @@ public sealed class LibertyFriends : Script
         if (rotation.X * rotation.X + rotation.Y * rotation.Y + rotation.Z * rotation.Z +
             rotation.W * rotation.W < 0.5f) return;
         rotation = Quaternion.Normalize(rotation);
-        Vehicle car;
-        if (!worldCars.TryGetValue(key, out car) || !Exists(car))
+        Dictionary<string, Vehicle> vehicles = playerVehicle ? cars : worldCars;
+        bool wasSimulating = delegatedTraffic.ContainsKey(key);
+        if (!simulate && delegatedTraffic.Remove(key))
         {
-            if (!CanSpawnWorldModel(model, now)) return;
-            car = World.CreateVehicle(model, position);
+            Ped previousDriver;
+            if (worldDrivers.TryGetValue(key, out previousDriver) && Exists(previousDriver))
+                previousDriver.Task.ClearAll();
+        }
+        Vehicle car;
+        if (!vehicles.TryGetValue(key, out car) || !Exists(car))
+        {
+            Vehicle original;
+            if (simulate && sourceTraffic.TryGetValue(key, out original) && Exists(original) &&
+                SquaredDistance(original.Position, position) < 100f && !original.isRequiredForMission &&
+                !Equals(original, Player.Character.CurrentVehicle) && !Equals(original, Player.LastVehicle))
+            {
+                car = original;
+                Ped originalDriver = car.GetPedOnSeat(VehicleSeat.Driver);
+                if (Exists(originalDriver) && !originalDriver.isRequiredForMission)
+                    worldDrivers[key] = originalDriver;
+            }
+            else
+            {
+                if (!CanSpawnWorldModel(model, now)) return;
+                car = World.CreateVehicle(model, position);
+            }
             if (!Exists(car)) return;
-            car.FreezePosition = true;
-            GTA.Native.Function.Call("SET_CAR_COLLISION", car, false);
+            wasSimulating = false;
+            car.RotationQuaternion = rotation;
+            EnableVehiclePhysics(car);
             car.DoorLock = DoorLock.ImpossibleToOpen;
-            worldCars[key] = car;
+            vehicles[key] = car;
             vehicleDetails.Remove(key);
             appliedDamage.Remove(key);
         }
-        QueueWorldPose(key, sample, now, position, heading, rotation);
-        ApplyVehicleDetails(key, car, fields, now);
-        ApplyDamage(key, car, new CarPhysics { Orientation = rotation, EngineHealth = engine,
-            BodyHealth = body, TankHealth = tank, TireMask = tires });
+        QueueWorldPose(key, sample, now, position, heading, rotation, playerVehicle);
+        if (!simulate || !wasSimulating)
+        {
+            ApplyVehicleDetails(key, car, fields, sample, now);
+            ApplyDamage(key, car, new CarPhysics { Orientation = rotation, EngineHealth = engine,
+                BodyHealth = body, TankHealth = tank, TireMask = tires });
+        }
+        if (simulate) delegatedTraffic[key] = now;
+        if (playerVehicle) return;
+        // Once delegated, the running game owns its driver's task and suspension.
+        if (simulate && wasSimulating && worldDrivers.ContainsKey(key) && Exists(worldDrivers[key])) return;
         Ped actor;
         if (worldDrivers.TryGetValue(key, out actor) &&
             (!Exists(actor) || actor.Model.Hash != driver || !Equals(actor.CurrentVehicle, car)))
@@ -1006,7 +1178,12 @@ public sealed class LibertyFriends : Script
             if (Exists(actor)) actor.Delete();
             worldDrivers.Remove(key);
         }
-        if (driver == 0 || worldDrivers.ContainsKey(key)) return;
+        if (driver == 0) return;
+        if (worldDrivers.TryGetValue(key, out actor) && Exists(actor))
+        {
+            if (simulate && !wasSimulating) actor.Task.CruiseWithVehicle(car, 26f, true);
+            return;
+        }
         var driverModel = new Model(driver);
         if (!driverModel.isPed || !CanSpawnWorldModel(driverModel, now)) return;
         actor = car.CreatePedOnSeat(VehicleSeat.Driver, driverModel);
@@ -1014,16 +1191,19 @@ public sealed class LibertyFriends : Script
         actor.Invincible = true;
         actor.BlockPermanentEvents = true;
         worldDrivers[key] = actor;
+        if (simulate) actor.Task.CruiseWithVehicle(car, 26f, true);
     }
 
-    private void ApplyVehicleDetails(string key, Vehicle car, string[] fields, long now)
+    private void ApplyVehicleDetails(string key, Vehicle car, string[] fields, long sample, long now)
     {
         uint colors, horn;
-        int flags, station;
+        int flags, station, forward, vertical;
         if (!uint.TryParse(fields[11], out colors) || !int.TryParse(fields[12], out flags) ||
-            !uint.TryParse(fields[13], out horn) || !int.TryParse(fields[14], out station)) return;
+            !uint.TryParse(fields[13], out horn) || !int.TryParse(fields[14], out station) ||
+            !int.TryParse(fields[20], out forward) || !int.TryParse(fields[21], out vertical)) return;
         VehicleDetails old;
         vehicleDetails.TryGetValue(key, out old);
+        if (old != null && sample <= old.MotionSample) return;
         if (old == null || old.Colors != colors)
         {
             GTA.Native.Function.Call("CHANGE_CAR_COLOUR", car, (int)(colors & 255), (int)(colors >> 8 & 255));
@@ -1040,7 +1220,8 @@ public sealed class LibertyFriends : Script
             lastHorn = now;
         }
         vehicleDetails[key] = new VehicleDetails { Colors = colors, Flags = flags, Horn = horn,
-            Station = station, LastHorn = lastHorn };
+            Station = station, LastHorn = lastHorn, MotionSample = sample, MotionAt = now,
+            ForwardSpeed = forward / 100f, VerticalSpeed = vertical / 100f, NextPhysics = old == null ? 0 : old.NextPhysics };
     }
 
     private void RemoveWorldEntity(string key)
@@ -1054,6 +1235,7 @@ public sealed class LibertyFriends : Script
         worldPeds.Remove(key);
         worldCars.Remove(key);
         worldTracks.Remove(key);
+        delegatedTraffic.Remove(key);
         worldGaits.Remove(key);
         appliedDamage.Remove(key);
         vehicleDetails.Remove(key);
@@ -1139,13 +1321,23 @@ public sealed class LibertyFriends : Script
             !worldTracks.TryGetValue(key, out track) || now - track.LastSeen > 450);
     }
 
-    private void QueueWorldPose(string key, long sample, long now, Vector3 position, float heading, Quaternion? orientation)
+    private bool CanCullTraffic(string key, Ped character, long now)
     {
+        Vehicle car = worldCars[key];
         PoseTrack track;
-        if (!worldTracks.TryGetValue(key, out track))
+        return !Exists(car) || (!Equals(car, character.CurrentVehicle) &&
+            (!worldTracks.TryGetValue(key, out track) || now - track.LastSeen > 3100));
+    }
+
+    private void QueueWorldPose(string key, long sample, long now, Vector3 position, float heading, Quaternion? orientation,
+        bool playerVehicle = false)
+    {
+        Dictionary<string, PoseTrack> tracks = playerVehicle ? carTracks : worldTracks;
+        PoseTrack track;
+        if (!tracks.TryGetValue(key, out track))
         {
             track = new PoseTrack();
-            worldTracks[key] = track;
+            tracks[key] = track;
         }
         track.Add(sample, now, position, heading, orientation);
     }
@@ -1192,7 +1384,9 @@ public sealed class LibertyFriends : Script
         {
             Vehicle car = entry.Value;
             if (!Exists(car)) continue;
-            SetCarPose(car, worldTracks[entry.Key].Read(now - 140));
+            long delegatedUntil;
+            if (delegatedTraffic.TryGetValue(entry.Key, out delegatedUntil) && now - delegatedUntil <= 1200) continue;
+            SetCarPose(entry.Key, car, worldTracks[entry.Key].Read(now - 140), now);
         }
         foreach (var entry in worldPeds)
         {
@@ -1204,7 +1398,7 @@ public sealed class LibertyFriends : Script
             ped.Heading = pose.Heading;
         }
         foreach (var entry in cars)
-            if (Exists(entry.Value)) SetCarPose(entry.Value, carTracks[entry.Key].Read(now - 85));
+            if (Exists(entry.Value)) SetCarPose(entry.Key, entry.Value, carTracks[entry.Key].Read(now - 85), now);
 
         foreach (var entry in avatars)
         {
@@ -1386,8 +1580,8 @@ public sealed class LibertyFriends : Script
                 if (!Exists(car)) continue;
                 if (peer.Physics != null) car.RotationQuaternion = peer.Physics.Orientation;
                 else car.Heading = peer.Heading;
-                car.FreezePosition = true;
-                GTA.Native.Function.Call("SET_CAR_COLLISION", car, false);
+                EnableVehiclePhysics(car);
+                car.DoorLock = DoorLock.ImpossibleToOpen;
                 cars[peer.CarId] = car;
                 appliedDamage.Remove(peer.CarId);
                 appliedVehicleFlags.Remove(peer.CarId);
@@ -1408,7 +1602,11 @@ public sealed class LibertyFriends : Script
         }
         foreach (string id in new List<string>(cars.Keys))
         {
-            if (!seen.Contains(id)) RemoveCar(id);
+            if (seen.Contains(id)) continue;
+            PoseTrack track;
+            Vehicle car = cars[id];
+            if (!Exists(car) || (carTracks.TryGetValue(id, out track) &&
+                clock.ElapsedMilliseconds - track.LastSeen > 3000)) RemoveCar(id);
         }
         if (ride != "-" && WinningPassenger(ride) != ownId && Exists(character))
         {
@@ -1457,6 +1655,23 @@ public sealed class LibertyFriends : Script
             if (candidate >= distance) continue;
             distance = candidate;
             nearest = entry.Key;
+        }
+        string traffic = null;
+        foreach (var entry in worldCars)
+        {
+            if (!Exists(entry.Value) || !remoteAmbientConfirmed && globalWorldHost == null) continue;
+            float candidate = SquaredDistance(character.Position, entry.Value.Position);
+            if (candidate >= distance) continue;
+            traffic = entry.Key;
+            distance = candidate;
+        }
+        if (traffic != null)
+        {
+            pendingTake = traffic;
+            takeUntil = clock.ElapsedMilliseconds + 2600;
+            takeMounted = false;
+            Trace("requested shared vehicle " + traffic);
+            return;
         }
         if (nearest == null) return;
         foreach (Peer peer in peers.Values)
@@ -1584,13 +1799,53 @@ public sealed class LibertyFriends : Script
             current.Y + (target.Y - current.Y) * step, current.Z + (target.Z - current.Z) * step);
     }
 
-    private static void SetCarPose(Vehicle car, Pose pose)
+    private static Vector3 ReadVehicleVelocity(Vehicle car)
     {
-        Vector3 p = pose.Position;
-        if (SquaredDistance(car.Position, p) > 0.0001f)
-            GTA.Native.Function.Call("SET_CAR_COORDINATES_NO_OFFSET", car, p.X, p.Y, p.Z);
-        if (pose.Orientation.HasValue) car.RotationQuaternion = pose.Orientation.Value;
-        else car.Heading = pose.Heading;
+        GTA.Native.Pointer velocity = typeof(Vector3);
+        GTA.Native.Function.Call("GET_CAR_SPEED_VECTOR", car, velocity, false);
+        return velocity;
+    }
+
+    private static void EnableVehiclePhysics(Vehicle car)
+    {
+        car.FreezePosition = false;
+        GTA.Native.Function.Call("SET_CAR_COLLISION", car, true);
+    }
+
+    private void SetCarPose(string key, Vehicle car, Pose pose, long now)
+    {
+        VehicleDetails detail;
+        vehicleDetails.TryGetValue(key, out detail);
+        bool currentMotion = detail != null && now - detail.MotionAt < 450;
+        Vector3 actual = car.Position;
+        Vector3 target = pose.Position;
+        float error = SquaredDistance(actual, target);
+        bool snap = currentMotion && (error > 81f || Math.Abs(actual.Z - target.Z) > 3f);
+        if (snap) GTA.Native.Function.Call("SET_CAR_COORDINATES_NO_OFFSET", car, target.X, target.Y, target.Z);
+        if (pose.Orientation.HasValue)
+        {
+            Quaternion local = car.RotationQuaternion;
+            Quaternion wanted = pose.Orientation.Value;
+            float dot = local.X * wanted.X + local.Y * wanted.Y + local.Z * wanted.Z + local.W * wanted.W;
+            if (snap || Math.Abs(dot) < 0.9997f)
+                car.RotationQuaternion = snap ? wanted : BlendOrientation(local, wanted, 0.20f);
+        }
+        else if (snap || Math.Abs(BlendHeading(car.Heading, pose.Heading, 1f) - car.Heading) > 4f)
+            car.Heading = BlendHeading(car.Heading, pose.Heading, snap ? 1f : 0.18f);
+
+        if (!currentMotion || now < detail.NextPhysics || !(car.Model.isCar || car.Model.isBike)) return;
+        detail.NextPhysics = now + 55;
+        Vector3 velocity = ReadVehicleVelocity(car);
+        Vector3 direction = car.Direction;
+        float x = (direction.X * detail.ForwardSpeed + (target.X - actual.X) * 1.25f - velocity.X) * 0.30f;
+        float y = (direction.Y * detail.ForwardSpeed + (target.Y - actual.Y) * 1.25f - velocity.Y) * 0.30f;
+        float horizontal = (float)Math.Sqrt(x * x + y * y);
+        float scale = horizontal > 1.2f ? 1.2f / horizontal : 1f;
+        // Leave the suspension to the engine during normal wheel contact.
+        float z = Math.Abs(detail.VerticalSpeed) > 1.1f && Math.Abs(target.Z - actual.Z) > 0.45f
+            ? Math.Max(-0.10f, Math.Min(0.10f, (detail.VerticalSpeed - velocity.Z) * 0.10f)) : 0f;
+        if (horizontal > 0.08f || z != 0f)
+            car.ApplyForce(new Vector3(x * scale, y * scale, z));
     }
 
     private static float SquaredDistance(Vector3 a, Vector3 b)

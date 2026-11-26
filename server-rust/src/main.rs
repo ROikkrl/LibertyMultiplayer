@@ -16,13 +16,16 @@ const MAX_PLAYERS: usize = 4;
 const PACKET_LIMIT: usize = 1200;
 const SIGNATURE_LEN: usize = 32;
 const PLAYER_TIMEOUT: Duration = Duration::from_secs(3);
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 type Position = [f64; 3];
 type Sector = (i32, i32);
 
 struct Player {
     state: String,
+    joined: Instant,
     seen: Instant,
+    power: u8,
     address: SocketAddr,
     modern: bool,
     shares_world: bool,
@@ -31,6 +34,7 @@ struct Player {
     driving: bool,
     vehicle_token: i32,
     vehicle_model: i32,
+    owned_vehicle: Option<(i32, i32)>,
     seated: bool,
     combat: Option<CombatInput>,
     result: CombatResult,
@@ -99,6 +103,13 @@ fn parse_update(payload: &str, now: Instant, address: SocketAddr) -> Option<Upda
     let player = fields.next()?;
     let challenge = fields.next()?;
     if !valid_id(player) || !valid_id(challenge) {
+        return None;
+    }
+    if fields.next()? != VERSION {
+        return None;
+    }
+    let power: u8 = fields.next()?.parse().ok()?;
+    if !(1..=99).contains(&power) {
         return None;
     }
     let position = [
@@ -241,8 +252,9 @@ fn parse_update(payload: &str, now: Instant, address: SocketAddr) -> Option<Upda
         None
     };
     Some(Update { id: player, challenge, target, player: Player {
-        state, seen: now, address, modern: metadata.is_some(), shares_world, position, sample,
-        driving, vehicle_token, vehicle_model, seated, combat, result: CombatResult::default(),
+        state, joined: now, seen: now, power, address, modern: metadata.is_some(), shares_world, position, sample,
+        driving, vehicle_token, vehicle_model, owned_vehicle: driving.then_some((vehicle_token, vehicle_model)),
+        seated, combat, result: CombatResult::default(),
     } })
 }
 
@@ -389,12 +401,26 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: Option<fs::File>) -> io:
             Some(payload) => payload,
             None => continue,
         };
-        if let Some(challenge) = payload.strip_prefix("LF-PING ") {
-            if valid_id(challenge) {
-                let pong = format!("LF-PONG {challenge}");
+        if let Some(probe) = payload.strip_prefix("LF-PING ") {
+            let mut fields = probe.split_ascii_whitespace();
+            if let Some(challenge) = fields.next().filter(|challenge| valid_id(challenge)) {
+                let client_version = fields.next();
+                if fields.next().is_some() { continue; }
+                let kind = if client_version == Some(VERSION) { "LF-PONG" } else { "LF-VERSION" };
+                let pong = format!("{kind} {challenge} {VERSION}");
                 reply(&socket, &signer, pong.as_bytes(), sender, &mut outgoing, &mut log);
             }
             continue;
+        }
+        if payload.starts_with("LF1 ") {
+            let mut fields = payload.split_ascii_whitespace().skip(1);
+            if let (Some(id), Some(challenge)) = (fields.next(), fields.next()) {
+                if valid_id(id) && valid_id(challenge) && fields.next() != Some(VERSION) {
+                    let mismatch = format!("LF-VERSION {challenge} {VERSION}");
+                    reply(&socket, &signer, mismatch.as_bytes(), sender, &mut outgoing, &mut log);
+                    continue;
+                }
+            }
         }
         if let Some(id) = payload.strip_prefix("LF-LEAVE ") {
             if players.get(id).map_or(false, |player| player.address == sender) {
@@ -406,7 +432,7 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: Option<fs::File>) -> io:
             continue;
         }
         let now = Instant::now();
-        if payload.starts_with("LFWQ ") || payload.starts_with("LFWU ") {
+        if payload.starts_with("LFWQ ") || payload.starts_with("LFWU ") || payload.starts_with("LFWT ") {
             if let Some(pages) = world.handle(payload, sender, &players, now) {
                 for page in pages {
                     reply(&socket, &signer, page.as_bytes(), sender, &mut outgoing, &mut log);
@@ -431,7 +457,8 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: Option<fs::File>) -> io:
                 previous = Some((player.position, player.sample));
             }
             let result = std::mem::take(&mut player.result);
-            *player = Player { result, ..update };
+            *player = Player { result, joined: player.joined, power: player.power,
+                owned_vehicle: update.owned_vehicle.or(player.owned_vehicle), ..update };
         } else if players.len() < MAX_PLAYERS {
             players.insert(id.to_owned(), update);
             event(&mut log, &format!("connect player={id} ip={} online={}/{}",
@@ -510,7 +537,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut log = env::var_os("LF_LOG_FILE")
         .map(|path| fs::OpenOptions::new().create(true).append(true).open(path))
         .transpose()?;
-    event(&mut log, &format!("Liberty Friends listening on {bind}:{port}/UDP"));
+    event(&mut log, &format!("Liberty Friends {VERSION} listening on {bind}:{port}/UDP"));
     event(&mut log, "world_sync protocol=LFW1 source=GTA_IV");
     serve(socket, signer, log)?;
     Ok(())

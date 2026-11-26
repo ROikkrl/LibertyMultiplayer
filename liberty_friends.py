@@ -1,10 +1,12 @@
 import argparse
 import hmac
+import os
 import re
 import secrets
 import socket
 import time
 from pathlib import Path
+from release_updates import VERSION
 
 MAX_PLAYERS = 4
 TIMEOUT = 3.0
@@ -15,8 +17,30 @@ RIDE_ID = re.compile(rb"(?:-|[0-9a-f]{16}:-?[0-9]{1,10})")
 WORLD_ENTITY = re.compile(rb"(?:p(?:,-?[0-9]{1,11}){6}|v(?:,-?[0-9]{1,11}){6}(?:,-?[0-9]{1,4}){0,4})")
 STATE_META = re.compile(rb"~([0-9]{1,12}),([0-9]{1,12}),([01]),([0-3]),(-1|[0-9]{1,3}),(-|[A-Za-z0-9_]{1,32})")
 COMBAT_META = re.compile(rb"!([0-7]),([0-9]{1,19}),([0-2]),(-|[0-9a-f]{16})")
-WORLD_PAGE_ROWS = 6
-WORLD_MAX_PAGES = 5
+WORLD_PAGE_ROWS = 5
+WORLD_MAX_PAGES = 6
+VEHICLE_TAKE = re.compile(rb"t,([0-9a-f]{16}),(-?[0-9]{1,10}),(-?[0-9]{1,10}),([01])")
+WIRE_VERSION = VERSION.encode("ascii")
+VERSION_TOKEN = re.compile(rb"[0-9]+\.[0-9]+\.[0-9]+")
+
+
+class VersionMismatch(ValueError):
+    def __init__(self, received, version=VERSION):
+        super().__init__(f"Версии не совпадают. Версия клиента: {version}. Версия сервера: {received}")
+
+
+def suggested_power():
+    return min(99, max(1, (os.cpu_count() or 1) * 4))
+
+
+def parse_power(value):
+    value = value.strip().replace(",", ".")
+    if not re.fullmatch(r"0\.[0-9]{1,2}", value):
+        raise ValueError("Допустимый индекс мощности от 0.01 до 0.99.")
+    power = int(value[2:].ljust(2, "0"))
+    if not 1 <= power <= 99:
+        raise ValueError("Допустимый индекс мощности от 0.01 до 0.99.")
+    return power
 
 
 def coordinates(fields):
@@ -106,16 +130,37 @@ def open_packet(key, packet):
     raise ValueError("invalid packet")
 
 
-def check_server(host, port, key):
+def validate_reply(response, challenge, version=VERSION):
+    fields = response.split()
+    if len(fields) == 3 and fields[1] == challenge and VERSION_TOKEN.fullmatch(fields[2]):
+        if fields[0] == b"LF-VERSION" or fields[0] == b"LF-PONG" and fields[2] != version.encode("ascii"):
+            raise VersionMismatch(fields[2].decode("ascii"), version)
+        if fields[0] == b"LF-PONG":
+            return
+    raise ValueError("Unexpected server response")
+
+
+def probe_connection(sock, key, version=VERSION):
     challenge = secrets.token_hex(8).encode("ascii")
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        sock.settimeout(2)
-        sock.connect((host, port))
-        started = time.monotonic()
+    sock.settimeout(1)
+    started = time.monotonic()
+    sock.send(seal(key, b" ".join((b"LF-PING", challenge, version.encode("ascii")))))
+    try:
+        response = open_packet(key, sock.recv(PACKET_LIMIT + 1))
+    except socket.timeout:
+        # Pre-version servers respond to a two-field probe without reporting their version.
         sock.send(seal(key, b"LF-PING " + challenge))
-        if open_packet(key, sock.recv(PACKET_LIMIT + 1)) != b"LF-PONG " + challenge:
-            raise ValueError("unexpected server reply")
+        response = open_packet(key, sock.recv(PACKET_LIMIT + 1))
+        if response == b"LF-PONG " + challenge:
+            raise VersionMismatch("не сообщается устаревшим сервером", version)
+    validate_reply(response, challenge, version)
     return round((time.monotonic() - started) * 1000)
+
+
+def check_server(host, port, key, version=VERSION):
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.connect((host, port))
+        return probe_connection(sock, key, version)
 
 
 def serve(args):
@@ -137,8 +182,9 @@ def serve(args):
                 continue
             try:
                 parts = open_packet(args.key, packet).split()
-                if len(parts) == 2 and parts[0] == b"LF-PING" and PLAYER_ID.fullmatch(parts[1]):
-                    sock.sendto(seal(args.key, b"LF-PONG " + parts[1]), address)
+                if 2 <= len(parts) <= 3 and parts[0] == b"LF-PING" and PLAYER_ID.fullmatch(parts[1]):
+                    kind = b"LF-PONG" if parts[2:] == [WIRE_VERSION] else b"LF-VERSION"
+                    sock.sendto(seal(args.key, b" ".join((kind, parts[1], WIRE_VERSION))), address)
                     continue
                 if len(parts) == 2 and parts[0] == b"LF-LEAVE":
                     peer = players.get(parts[1])
@@ -151,6 +197,12 @@ def serve(args):
                     continue
                 if not PLAYER_ID.fullmatch(challenge):
                     continue
+                if not fields or fields[0] != WIRE_VERSION:
+                    sock.sendto(seal(args.key, b" ".join((b"LF-VERSION", challenge, WIRE_VERSION))), address)
+                    continue
+                if len(fields) < 2 or not fields[1].isdigit() or not 1 <= int(fields[1]) <= 99:
+                    continue
+                fields = fields[2:]
                 position = coordinates(fields).split(b" !", 1)[0]
             except ValueError:
                 continue
@@ -209,6 +261,10 @@ class WorldExchange:
             return
         if frame != self.last_upload:
             rows = lines[1:]
+            if rows and rows[0].startswith(b"t,"):
+                take = VEHICLE_TAKE.fullmatch(rows.pop(0))
+                if take:
+                    sock.send(seal(self.key, b" ".join((b"LFWT", self.player_id, *take.groups()))))
             total = max(1, (len(rows) + WORLD_PAGE_ROWS - 1) // WORLD_PAGE_ROWS)
             for page in range(total):
                 prefix = b" ".join((b"LFWU", self.player_id, sequence, episode,
@@ -269,6 +325,8 @@ def join(args, stop=None, report=print):
     last_change = 0.0
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.connect((args.host, args.port))
+        probe_connection(sock, args.key)
+        power = str(getattr(args, "power", suggested_power())).encode("ascii")
         server_address = sock.getpeername()[0].encode("ascii")
         pause_marker = b"PAUSED " + player_id + b"\n"
         leave_packet = seal(args.key, b"LF-LEAVE " + player_id)
@@ -297,13 +355,15 @@ def join(args, stop=None, report=print):
                     tick, *fields = position.split()
                     sample = str(int(tick)).encode("ascii")
                     challenge = secrets.token_hex(8).encode("ascii")
-                    payload = b" ".join((b"LF1", player_id, challenge, coordinates(fields)))
+                    payload = b" ".join((b"LF1", player_id, challenge, WIRE_VERSION, power, coordinates(fields)))
                     next_status = "Waiting for the server"
                     sock.send(seal(args.key, payload))
                     deadline = started + 0.15
                     while time.monotonic() < deadline:
                         sock.settimeout(max(0.001, deadline - time.monotonic()))
                         response = open_packet(args.key, sock.recv(65535))
+                        if response.startswith(b"LF-VERSION "):
+                            validate_reply(response, challenge)
                         if response.startswith(b"LFW1 "):
                             try:
                                 world.receive(response)
@@ -333,6 +393,8 @@ def join(args, stop=None, report=print):
                         except OSError:
                             pass
                         break
+            except VersionMismatch:
+                raise
             except (OSError, ValueError):
                 pass
             if next_status != status:
@@ -352,6 +414,7 @@ def cli():
     server.add_argument("--bind", default="127.0.0.1")
     client = commands.add_parser("join")
     client.add_argument("--host", default="127.0.0.1")
+    client.add_argument("--power-index", dest="power", type=parse_power, default=suggested_power())
     client.add_argument("--mod-dir", required=True, type=Path)
     for command in (server, client):
         command.add_argument("--port", default=24840, type=int)
@@ -364,6 +427,8 @@ def cli():
     args.key = args.key.encode("utf-8")
     try:
         (serve if args.command == "serve" else join)(args)
+    except VersionMismatch as error:
+        parser.exit(1, str(error) + "\n")
     except KeyboardInterrupt:
         pass
 

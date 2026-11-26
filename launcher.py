@@ -8,7 +8,7 @@ from tkinter import filedialog, ttk
 
 from installer import install
 from launcher_settings import load_settings, save_settings
-from liberty_friends import check_server, join
+from liberty_friends import VersionMismatch, check_server, join, parse_power, suggested_power
 from release_updates import VERSION, latest_update, repository
 
 
@@ -28,6 +28,7 @@ class Launcher:
         self.host = tk.StringVar(value=settings.get("host", "127.0.0.1"))
         self.port = tk.StringVar(value=settings.get("port", "24840"))
         self.key = tk.StringVar(value=settings.get("key", ""))
+        self.power = tk.StringVar(value=settings.get("power", f"{suggested_power() / 100:.2f}"))
         self.save_timer = None
         self.status = tk.StringVar(value="Закрой GTA IV и выбери папку игры для установки.")
         root.title(f"LibertyMultiplayer {VERSION}")
@@ -37,7 +38,7 @@ class Launcher:
         panel.columnconfigure(1, weight=1)
         for row, (label, value) in enumerate((
             ("Папка GTA IV", self.folder), ("Сервер", self.host),
-            ("UDP-порт", self.port), ("Ключ сессии", self.key),
+            ("UDP-порт", self.port), ("Ключ сессии", self.key), ("Мощность (0.01–0.99)", self.power),
         )):
             ttk.Label(panel, text=label).grid(row=row, column=0, sticky="w", padx=(0, 12), pady=5)
             entry = ttk.Entry(panel, textvariable=value, width=40, show="*" if row == 3 else "")
@@ -52,23 +53,23 @@ class Launcher:
         self.patch_button = ttk.Button(panel, text="Патчить выбранную папку", command=self.patch_selected)
         self.patch_button.grid(row=1, column=2, padx=(8, 0))
         self.button = ttk.Button(panel, text="Подключиться", command=self.toggle)
-        self.button.grid(row=4, column=1, sticky="w", pady=(10, 4))
+        self.button.grid(row=5, column=1, sticky="w", pady=(10, 4))
         self.check_button = ttk.Button(panel, text="Проверить сервер", command=self.probe)
-        self.check_button.grid(row=4, column=2, padx=(8, 0))
+        self.check_button.grid(row=5, column=2, padx=(8, 0))
         self.check_status = tk.StringVar()
         ttk.Label(panel, textvariable=self.check_status, wraplength=440).grid(
-            row=6, column=0, columnspan=3, sticky="w"
+            row=7, column=0, columnspan=3, sticky="w"
         )
         ttk.Label(panel, textvariable=self.status, wraplength=440).grid(
-            row=5, column=0, columnspan=3, sticky="w", pady=(5, 0)
+            row=6, column=0, columnspan=3, sticky="w", pady=(5, 0)
         )
         if self.repo:
             self.update = tk.StringVar(value="Проверка обновлений…")
-            ttk.Label(panel, textvariable=self.update).grid(row=7, column=0, columnspan=2, sticky="w")
-            ttk.Button(panel, text="GitHub Releases", command=self.open_releases).grid(row=7, column=2)
+            ttk.Label(panel, textvariable=self.update).grid(row=8, column=0, columnspan=2, sticky="w")
+            ttk.Button(panel, text="GitHub Releases", command=self.open_releases).grid(row=8, column=2)
             threading.Thread(target=self.check_updates, daemon=True).start()
         root.protocol("WM_DELETE_WINDOW", self.close)
-        for setting in (self.folder, self.host, self.port, self.key):
+        for setting in (self.folder, self.host, self.port, self.key, self.power):
             setting.trace_add("write", self.schedule_save)
         root.after(100, self.refresh)
 
@@ -80,7 +81,7 @@ class Launcher:
     def save(self):
         self.save_timer = None
         try:
-            save_settings({name: getattr(self, name).get() for name in ("folder", "host", "port", "key")})
+            save_settings({name: getattr(self, name).get() for name in ("folder", "host", "port", "key", "power")})
         except OSError:
             self.status.set("Не удалось сохранить настройки Windows.")
 
@@ -118,6 +119,8 @@ class Launcher:
     def run_probe(self, host, port, key):
         try:
             latency = check_server(host, port, key)
+        except VersionMismatch as error:
+            self.check_results.put(str(error))
         except (OSError, ValueError):
             self.check_results.put("Нет подтверждённого ответа. Проверь адрес, UDP-порт, ключ и версию сервера.")
         else:
@@ -171,7 +174,12 @@ class Launcher:
         if not (game / "GTAIV.exe").is_file():
             self.status.set("В выбранной папке должен быть GTAIV.exe.")
             return
-        args = argparse.Namespace(host=host, port=port, key=key,
+        try:
+            power = parse_power(self.power.get())
+        except ValueError as error:
+            self.status.set(str(error))
+            return
+        args = argparse.Namespace(host=host, port=port, key=key, power=power,
                                   mod_dir=game / "mods" / "LibertyFriends")
         self.stop.clear()
         self.install_button.config(state="disabled")
@@ -184,7 +192,7 @@ class Launcher:
     def connect(self, args):
         try:
             join(args, stop=self.stop, report=lambda message: self.messages.put((message, False)))
-        except (OSError, SystemExit) as error:
+        except (OSError, VersionMismatch, SystemExit) as error:
             self.messages.put((str(error), True))
         else:
             self.messages.put(("Отключено", True))

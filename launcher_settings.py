@@ -42,7 +42,7 @@ def load_settings():
         return {}
     if not isinstance(data, dict):
         return {}
-    values = {key: data[key] for key in ("folder", "host", "port") if isinstance(data.get(key), str)}
+    values = {key: data[key] for key in ("folder", "host", "port", "power") if isinstance(data.get(key), str)}
     try:
         secret = data.get("key_dpapi")
         if isinstance(secret, str) and secret:
@@ -55,7 +55,7 @@ def load_settings():
 def save_settings(values):
     path = settings_file()
     path.parent.mkdir(parents=True, exist_ok=True)
-    data = {key: values[key] for key in ("folder", "host", "port")}
+    data = {key: values[key] for key in ("folder", "host", "port", "power") if key in values}
     data["key_dpapi"] = (base64.b64encode(protect(values["key"].encode("utf-8"))).decode("ascii")
                          if values["key"] else "")
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as stream:
