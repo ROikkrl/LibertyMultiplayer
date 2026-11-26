@@ -15,6 +15,8 @@ RIDE_ID = re.compile(rb"(?:-|[0-9a-f]{16}:-?[0-9]{1,10})")
 WORLD_ENTITY = re.compile(rb"(?:p(?:,-?[0-9]{1,11}){6}|v(?:,-?[0-9]{1,11}){6}(?:,-?[0-9]{1,4}){0,4})")
 STATE_META = re.compile(rb"~([0-9]{1,12}),([0-9]{1,12}),([01]),([0-3]),(-1|[0-9]{1,3}),(-|[A-Za-z0-9_]{1,32})")
 COMBAT_META = re.compile(rb"!([0-7]),([0-9]{1,19}),([0-2]),(-|[0-9a-f]{16})")
+WORLD_PAGE_ROWS = 6
+WORLD_MAX_PAGES = 5
 
 
 def coordinates(fields):
@@ -138,6 +140,12 @@ def serve(args):
                 if len(parts) == 2 and parts[0] == b"LF-PING" and PLAYER_ID.fullmatch(parts[1]):
                     sock.sendto(seal(args.key, b"LF-PONG " + parts[1]), address)
                     continue
+                if len(parts) == 2 and parts[0] == b"LF-LEAVE":
+                    peer = players.get(parts[1])
+                    if peer is not None and peer[2] == address:
+                        del players[parts[1]]
+                        print(f"Disconnected {parts[1].decode()} ({len(players)}/{MAX_PLAYERS})", flush=True)
+                    continue
                 version, player_id, challenge, *fields = parts
                 if version != b"LF1" or not PLAYER_ID.fullmatch(player_id):
                     continue
@@ -150,10 +158,10 @@ def serve(args):
             if player_id not in players and len(players) >= MAX_PLAYERS:
                 continue
             if player_id not in players:
-                print(f"Connected {player_id.decode()} ({len(players)+1}/{MAX_PLAYERS})", flush=True)
-            players[player_id] = (now, position)
+                print(f"Connected {player_id.decode()} ip={address[0]} ({len(players)+1}/{MAX_PLAYERS})", flush=True)
+            players[player_id] = (now, position, address)
             metadata = position.rpartition(b" ~")[2] if b" ~" in position else None
-            candidates = [peer for peer, (_, state) in players.items()
+            candidates = [peer for peer, (_, state, _) in players.items()
                           if b" ~" in state and state.rpartition(b" ~")[2].split(b",")[2] == b"1"]
             if world_owner not in candidates:
                 world_owner = min(candidates, default=None)
@@ -161,6 +169,84 @@ def serve(args):
             rows.extend(peer + b" " + (data[1] if metadata is not None else data[1].split(b" ~", 1)[0])
                         for peer, data in players.items() if peer != player_id)
             sock.sendto(seal(args.key, b"\n".join(rows) + b"\n"), address)
+
+
+class WorldExchange:
+    def __init__(self, directory, player_id, key):
+        self.outgoing = directory / "world-local.txt"
+        self.incoming = directory / "world-remote.txt"
+        self.temporary = directory / ("world-" + player_id.decode("ascii") + ".tmp")
+        self.player_id = player_id
+        self.key = key
+        self.next_poll = 0.0
+        self.last_upload = None
+        self.requests = {}
+        self.received_at = 0
+
+    def pause(self):
+        self.requests.clear()
+        self.last_upload = None
+
+    def poll(self, sock, sample):
+        now = time.monotonic()
+        if now < self.next_poll:
+            return
+        self.next_poll = now + 0.1
+        self.requests = {token: state for token, state in self.requests.items()
+                         if now - state[0] < 0.5}
+        try:
+            frame = self.outgoing.read_bytes()
+        except OSError:
+            return
+        lines = frame.splitlines()
+        if not lines or not frame.endswith(b"\n") or len(lines) > 1 + WORLD_PAGE_ROWS * WORLD_MAX_PAGES:
+            return
+        header = lines[0].split()
+        if len(header) != 3 or header[0] != self.player_id or not header[1].isdigit():
+            return
+        _, sequence, episode = header
+        if episode not in (b"0", b"1", b"2") or abs(int(sequence) - int(sample)) > 1000:
+            return
+        if frame != self.last_upload:
+            rows = lines[1:]
+            total = max(1, (len(rows) + WORLD_PAGE_ROWS - 1) // WORLD_PAGE_ROWS)
+            for page in range(total):
+                prefix = b" ".join((b"LFWU", self.player_id, sequence, episode,
+                                    str(page).encode("ascii"), str(total).encode("ascii")))
+                selected = rows[page * WORLD_PAGE_ROWS:(page + 1) * WORLD_PAGE_ROWS]
+                payload = prefix + b"\n" + b"\n".join(selected)
+                if len(payload) + 32 <= PACKET_LIMIT:
+                    sock.send(seal(self.key, payload))
+            self.last_upload = frame
+        token = secrets.token_hex(8).encode("ascii")
+        self.requests[token] = (now, time.monotonic_ns(), sample, episode, {})
+        sock.send(seal(self.key, b" ".join((b"LFWQ", self.player_id, token, episode))))
+
+    def receive(self, response):
+        header, _, rows = response.partition(b"\n")
+        fields = header.split()
+        if len(fields) != 5 or fields[1] not in self.requests or not PLAYER_ID.fullmatch(fields[2]):
+            return
+        _, token, owner, index, total = fields
+        if not index.isdigit() or not total.isdigit() or not response.endswith(b"\n"):
+            return
+        index, total = int(index), int(total)
+        if not 0 <= index < total <= WORLD_MAX_PAGES or len(rows.splitlines()) > WORLD_PAGE_ROWS:
+            return
+        _, timestamp, sample, episode, pages = self.requests[token]
+        if timestamp <= self.received_at:
+            del self.requests[token]
+            return
+        if pages and next(iter(pages.values()))[:2] != (owner, total):
+            return
+        pages[index] = (owner, total, rows)
+        if len(pages) != total:
+            return
+        header = b" ".join((self.player_id, str(timestamp).encode("ascii"), sample, episode, owner))
+        self.temporary.write_bytes(header + b"\n" + b"".join(pages[page][2] for page in range(total)))
+        self.temporary.replace(self.incoming)
+        self.received_at = timestamp
+        del self.requests[token]
 
 
 def join(args, stop=None, report=print):
@@ -172,6 +258,7 @@ def join(args, stop=None, report=print):
     temporary_file = directory / "peers.tmp"
     bridge_file = directory / "bridge-live.txt"
     player_id = secrets.token_hex(8).encode("ascii")
+    world = WorldExchange(directory, player_id, args.key)
     (directory / "player.txt").write_bytes(player_id)
     bridge_temporary = directory / ("bridge-" + player_id.decode("ascii") + ".tmp")
     next_heartbeat = 0.0
@@ -182,6 +269,9 @@ def join(args, stop=None, report=print):
     last_change = 0.0
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.connect((args.host, args.port))
+        server_address = sock.getpeername()[0].encode("ascii")
+        pause_marker = b"PAUSED " + player_id + b"\n"
+        leave_packet = seal(args.key, b"LF-LEAVE " + player_id)
         status = None
         while stop is None or not stop.is_set():
             started = time.monotonic()
@@ -198,36 +288,51 @@ def join(args, stop=None, report=print):
                 position = local_file.read_bytes()
                 if position != last_position:
                     last_position, last_change = position, started
-                if not position.endswith(b"\n") or started - last_change >= TIMEOUT:
-                    raise ValueError("no fresh position")
-                tick, *fields = position.split()
-                int(tick)
-                challenge = secrets.token_hex(8).encode("ascii")
-                payload = b" ".join((b"LF1", player_id, challenge, coordinates(fields)))
-                next_status = "Waiting for the server"
-                sock.send(seal(args.key, payload))
-                deadline = started + 0.15
-                while time.monotonic() < deadline:
-                    sock.settimeout(max(0.001, deadline - time.monotonic()))
-                    response = open_packet(args.key, sock.recv(65535))
-                    header, _, rows = response.partition(b"\n")
-                    fields = header.split()
-                    if not fields or fields[0] != challenge or len(fields) not in (1, 2, 5):
-                        continue
-                    if len(fields) >= 2 and fields[1] != b"-" and not PLAYER_ID.fullmatch(fields[1]):
-                        continue
-                    if len(fields) == 5 and (
-                        not fields[2].isdigit() or not fields[3].isdigit() or
-                        fields[4] not in (b"0", b"1", b"2", b"3")
-                    ):
-                        continue
-                    bridge_header = str(time.monotonic_ns()).encode()
-                    if len(fields) > 1:
-                        bridge_header += b":" + player_id + b" " + b" ".join(fields[1:])
-                    temporary_file.write_bytes(bridge_header + b"\n" + rows)
-                    temporary_file.replace(peer_file)
-                    next_status = f"Connected — other players: {len(rows.splitlines())}"
-                    break
+                if position == pause_marker:
+                    next_status = "Paused in GTA IV"
+                    if status != next_status:
+                        world.pause()
+                        sock.send(leave_packet)
+                elif position.endswith(b"\n") and started - last_change < TIMEOUT:
+                    tick, *fields = position.split()
+                    sample = str(int(tick)).encode("ascii")
+                    challenge = secrets.token_hex(8).encode("ascii")
+                    payload = b" ".join((b"LF1", player_id, challenge, coordinates(fields)))
+                    next_status = "Waiting for the server"
+                    sock.send(seal(args.key, payload))
+                    deadline = started + 0.15
+                    while time.monotonic() < deadline:
+                        sock.settimeout(max(0.001, deadline - time.monotonic()))
+                        response = open_packet(args.key, sock.recv(65535))
+                        if response.startswith(b"LFW1 "):
+                            try:
+                                world.receive(response)
+                            except OSError:
+                                pass
+                            continue
+                        header, _, rows = response.partition(b"\n")
+                        fields = header.split()
+                        if not fields or fields[0] != challenge or len(fields) not in (1, 2, 5):
+                            continue
+                        if len(fields) >= 2 and fields[1] != b"-" and not PLAYER_ID.fullmatch(fields[1]):
+                            continue
+                        if len(fields) == 5 and (
+                            not fields[2].isdigit() or not fields[3].isdigit() or
+                            fields[4] not in (b"0", b"1", b"2", b"3")
+                        ):
+                            continue
+                        bridge_header = str(time.monotonic_ns()).encode()
+                        if len(fields) > 1:
+                            source = b":".join((bridge_header, sample, server_address, player_id))
+                            bridge_header = source + b" " + b" ".join(fields[1:])
+                        temporary_file.write_bytes(bridge_header + b"\n" + rows)
+                        temporary_file.replace(peer_file)
+                        next_status = f"Connected — other players: {len(rows.splitlines())}"
+                        try:
+                            world.poll(sock, sample)
+                        except OSError:
+                            pass
+                        break
             except (OSError, ValueError):
                 pass
             if next_status != status:

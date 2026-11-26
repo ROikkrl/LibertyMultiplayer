@@ -210,6 +210,8 @@ class Launcher:
                 message = "Подключено. Других игроков: " + message.rsplit(" ", 1)[-1]
             elif message.startswith("Waiting for GTA IV"):
                 message = "Загрузи сохранение в GTA IV. Синхронизация запустится автоматически."
+            elif message == "Paused in GTA IV":
+                message = "Отключено в GTA IV. Нажми F9 для подключения."
             elif message == "Waiting for the server":
                 message = "Ожидание ответа от сервера."
             self.status.set(message)

@@ -8,3 +8,6 @@ player.txt
 bridge-live.txt
 bridge-*.tmp
 client.log
+world-local.txt
+world-remote.txt
+world-*.tmp

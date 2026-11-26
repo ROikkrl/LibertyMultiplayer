@@ -6,8 +6,9 @@ use std::error::Error;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Write};
-use std::net::{Ipv4Addr, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+mod world;
 
 type PacketMac = Hmac<Sha256>;
 
@@ -22,12 +23,14 @@ type Sector = (i32, i32);
 struct Player {
     state: String,
     seen: Instant,
+    address: SocketAddr,
     modern: bool,
     shares_world: bool,
     position: Position,
     sample: u64,
     driving: bool,
     vehicle_token: i32,
+    vehicle_model: i32,
     seated: bool,
     combat: Option<CombatInput>,
     result: CombatResult,
@@ -80,7 +83,7 @@ fn authenticate<'a>(packet: &'a [u8], signer: &PacketMac) -> Option<&'a str> {
     std::str::from_utf8(payload).ok()
 }
 
-fn parse_update(payload: &str, now: Instant) -> Option<Update<'_>> {
+fn parse_update(payload: &str, now: Instant, address: SocketAddr) -> Option<Update<'_>> {
     let (payload, combat_data) = match payload.rsplit_once(" !") {
         Some((state, data)) => (state, Some(data)),
         None => (payload, None),
@@ -107,6 +110,7 @@ fn parse_update(payload: &str, now: Instant) -> Option<Update<'_>> {
     let mut state = format!("{x:.2} {y:.2} {z:.2}");
     let mut driving = false;
     let mut vehicle_token = 0;
+    let mut vehicle_model = 0;
     let mut seated = false;
     if let Some(raw_heading) = fields.next() {
         let heading: f64 = raw_heading.parse().ok()?;
@@ -123,6 +127,7 @@ fn parse_update(payload: &str, now: Instant) -> Option<Update<'_>> {
         }
         driving = car != 0;
         vehicle_token = handle;
+        vehicle_model = car;
         seated = driving || ride != "-";
         write!(&mut state, " {heading:.2} {ped} {car} {handle} {ride}").ok()?;
         if let Some(world) = fields.next() {
@@ -236,8 +241,8 @@ fn parse_update(payload: &str, now: Instant) -> Option<Update<'_>> {
         None
     };
     Some(Update { id: player, challenge, target, player: Player {
-        state, seen: now, modern: metadata.is_some(), shares_world, position, sample,
-        driving, vehicle_token, seated, combat, result: CombatResult::default(),
+        state, seen: now, address, modern: metadata.is_some(), shares_world, position, sample,
+        driving, vehicle_token, vehicle_model, seated, combat, result: CombatResult::default(),
     } })
 }
 
@@ -339,7 +344,7 @@ fn event(log: &mut Option<fs::File>, message: &str) {
     }
 }
 
-fn reply(socket: &UdpSocket, signer: &PacketMac, payload: &[u8], sender: std::net::SocketAddr,
+fn reply(socket: &UdpSocket, signer: &PacketMac, payload: &[u8], sender: SocketAddr,
          outgoing: &mut [u8], log: &mut Option<fs::File>) {
     let size = SIGNATURE_LEN + payload.len();
     if size > outgoing.len() {
@@ -363,12 +368,14 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: Option<fs::File>) -> io:
     let mut outgoing = [0u8; PACKET_LIMIT];
     let mut snapshot = String::with_capacity(PACKET_LIMIT - SIGNATURE_LEN);
     let mut region_owners = HashMap::<Sector, String>::new();
+    let mut world = world::World::default();
     loop {
         let now = Instant::now();
         players.retain(|id, player| {
             let alive = now.duration_since(player.seen) < PLAYER_TIMEOUT;
             if !alive {
                 event(&mut log, &format!("disconnect player={id} reason=timeout"));
+                world.remove(id);
             }
             alive
         });
@@ -389,8 +396,25 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: Option<fs::File>) -> io:
             }
             continue;
         }
+        if let Some(id) = payload.strip_prefix("LF-LEAVE ") {
+            if players.get(id).map_or(false, |player| player.address == sender) {
+                players.remove(id);
+                world.remove(id);
+                region_owners.retain(|_, owner| owner.as_str() != id);
+                event(&mut log, &format!("disconnect player={id} reason=client"));
+            }
+            continue;
+        }
         let now = Instant::now();
-        let Update { id, challenge, target, player: update } = match parse_update(payload, now) {
+        if payload.starts_with("LFWQ ") || payload.starts_with("LFWU ") {
+            if let Some(pages) = world.handle(payload, sender, &players, now) {
+                for page in pages {
+                    reply(&socket, &signer, page.as_bytes(), sender, &mut outgoing, &mut log);
+                }
+            }
+            continue;
+        }
+        let Update { id, challenge, target, player: update } = match parse_update(payload, now, sender) {
             Some(update) => update,
             None => continue,
         };
@@ -400,6 +424,9 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: Option<fs::File>) -> io:
         let region = sector(update.position);
         let mut previous = None;
         if let Some(player) = players.get_mut(id) {
+            if player.address != sender {
+                continue;
+            }
             if player.driving && update.driving && player.vehicle_token == update.vehicle_token {
                 previous = Some((player.position, player.sample));
             }
@@ -407,7 +434,8 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: Option<fs::File>) -> io:
             *player = Player { result, ..update };
         } else if players.len() < MAX_PLAYERS {
             players.insert(id.to_owned(), update);
-            event(&mut log, &format!("connect player={id} online={}/{}", players.len(), MAX_PLAYERS));
+            event(&mut log, &format!("connect player={id} ip={} online={}/{}",
+                sender.ip(), players.len(), MAX_PLAYERS));
         } else {
             continue;
         }
@@ -483,6 +511,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .map(|path| fs::OpenOptions::new().create(true).append(true).open(path))
         .transpose()?;
     event(&mut log, &format!("Liberty Friends listening on {bind}:{port}/UDP"));
+    event(&mut log, "world_sync protocol=LFW1 source=GTA_IV");
     serve(socket, signer, log)?;
     Ok(())
 }
