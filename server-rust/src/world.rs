@@ -35,7 +35,7 @@ struct Entity {
 
 impl Entity {
     fn parse(row: &str, seen: Instant, sequence: u64) -> Option<Self> {
-        if row.len() > 176 {
+        if row.len() > 181 {
             return None;
         }
         let mut fields = row.split(',');
@@ -70,7 +70,7 @@ impl Entity {
                 return None;
             }
             fields.next()?.parse::<u32>().ok()?;
-            bounded(fields.next()?, 0, 15)?;
+            bounded(fields.next()?, 0, 31)?;
             fields.next()?.parse::<u32>().ok()?;
             bounded(fields.next()?, -1, 255)?;
             fields.next()?.parse::<i32>().ok()?;
@@ -80,6 +80,8 @@ impl Entity {
             bounded(fields.next()?, -1, 15)?;
             bounded(fields.next()?, -15_000, 15_000)?;
             bounded(fields.next()?, -6_000, 6_000)?;
+            bounded(fields.next()?, -1_000, 1_000)?;
+            bounded(fields.next()?, 0, 60_000)?;
         }
         let (origin, row) = if kind == b'm' {
             let (rest, source) = row[1..].rsplit_once(',')?;
@@ -123,6 +125,20 @@ struct Publisher {
 
 type TrafficKey = (String, i32, i32);
 
+pub fn traffic_key(value: &str) -> Option<(&str, i32, i32)> {
+    if value.len() > 42 {
+        return None;
+    }
+    let mut fields = value.split(':');
+    let origin = fields.next()?;
+    if !valid_id(origin) || fields.next()? != "v" {
+        return None;
+    }
+    let handle: i32 = fields.next()?.parse().ok()?;
+    let model: i32 = fields.next()?.parse().ok()?;
+    (handle != 0 && model != 0 && fields.next().is_none()).then_some((origin, handle, model))
+}
+
 struct Transfer {
     driver: String,
     simulator: String,
@@ -159,7 +175,7 @@ impl World {
         let mut ordered: Vec<_> = self.publishers.iter().collect();
         ordered.sort_unstable_by_key(|(id, _)| {
             let player = &players[*id];
-            (std::cmp::Reverse(priority(player.power, now.duration_since(player.joined))),
+            (std::cmp::Reverse(priority(player.power, Duration::from_millis(u64::from(player.play_millis)))),
                 player.joined, id.as_str())
         });
         let mut sources = HashMap::with_capacity(ordered.len());
@@ -223,7 +239,7 @@ impl World {
             let best = available.min_by(|a, b| {
                 let rank = |id: &String| {
                     (sources.get(id) != Some(id), std::cmp::Reverse(priority(players[id].power,
-                        now.duration_since(players[id].joined))), players[id].joined)
+                        Duration::from_millis(u64::from(players[id].play_millis)))), players[id].joined)
                 };
                 rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
             });
@@ -242,8 +258,14 @@ impl World {
     fn observe_traffic(&mut self, id: &str, episode: u8, mut state: Entity) {
         let origin = state.origin.take().unwrap_or_else(|| id.to_owned());
         let key = (origin, state.id, state.model);
-        if self.transfers.get(&key).map_or(false, |transfer| transfer.committed) {
-            return;
+        if let Some(transfer) = self.transfers.get_mut(&key) {
+            if transfer.committed {
+                // Keep a tombstone while the original simulator is still publishing the old car.
+                if id == key.0 || id == transfer.simulator {
+                    transfer.until = state.seen + Duration::from_secs(20);
+                }
+                return;
+            }
         }
         let delegated = state.kind == b'm';
         if let Some(vehicle) = self.traffic.get(&key) {
@@ -258,28 +280,52 @@ impl World {
         self.traffic.insert(key, Traffic { state, simulator: id.to_owned(), episode, delegated });
     }
 
-    fn transfer(&mut self, driver: &str, source: &str, handle: i32, model: i32, commit: bool,
+    pub fn commit_driving(&mut self, driver: &str, claim: &str, player: &Player, now: Instant) -> bool {
+        let (origin, handle, model) = match traffic_key(claim) {
+            Some(key) => key,
+            None => return false,
+        };
+        if !player.driving || player.vehicle_model != model {
+            return false;
+        }
+        if player.vehicle_origin.as_deref() == Some(claim) {
+            return true;
+        }
+        let key = (origin.to_owned(), handle, model);
+        let mut simulator = driver.to_owned();
+        if let Some(transfer) = self.transfers.get(&key).filter(|transfer| now < transfer.until) {
+            if transfer.driver != driver || (transfer.committed ||
+                distance_squared(transfer.position, player.position) > 22.0_f64.powi(2)) {
+                return false;
+            }
+            simulator = transfer.simulator.clone();
+        } else if let Some(vehicle) = self.traffic.get(&key) {
+            if vehicle.simulator != driver ||
+                distance_squared(vehicle.state.position, player.position) > 22.0_f64.powi(2) {
+                return false;
+            }
+        } else if origin != driver {
+            return false;
+        }
+        self.traffic.remove(&key);
+        self.transfers.insert(key, Transfer { driver: driver.to_owned(), simulator,
+            position: player.position, until: now + Duration::from_secs(20), committed: true });
+        true
+    }
+
+    fn transfer(&mut self, driver: &str, source: &str, handle: i32, model: i32,
                 players: &HashMap<String, Player>, now: Instant) {
         let key = (source.to_owned(), handle, model);
         let player = &players[driver];
-        if let Some(transfer) = self.transfers.get_mut(&key) {
-            if commit && transfer.driver == driver && player.driving && player.vehicle_model == model &&
-                !transfer.committed && distance_squared(transfer.position, player.position) <= 22.0_f64.powi(2) {
-                transfer.committed = true;
-                transfer.until = now + Duration::from_secs(12);
-                self.traffic.remove(&key);
-            }
-            return;
-        }
-        if commit || player.seated ||
+        if self.transfers.contains_key(&key) || player.seated ||
             self.transfers.values().any(|item| item.driver == driver && !item.committed) {
             return;
         }
         let nearby = self.traffic.get(&key).filter(|vehicle|
             (vehicle.delegated || vehicle.simulator != driver) &&
             self.publishers.get(driver).map_or(false, |publisher| publisher.episode == vehicle.episode) &&
-            now.duration_since(vehicle.state.seen) < VEHICLE_TTL &&
-            distance_squared(vehicle.state.position, player.position) <= 9.0_f64.powi(2));
+            now.duration_since(vehicle.state.seen) < OCCUPIED_VEHICLE_TTL &&
+            distance_squared(vehicle.state.position, player.position) <= 11.0_f64.powi(2));
         if let Some(vehicle) = nearby {
             self.transfers.insert(key, Transfer {
                 driver: driver.to_owned(), position: vehicle.state.position, simulator: vehicle.simulator.clone(),
@@ -303,12 +349,11 @@ impl World {
                 let source = fields.next()?;
                 let handle = fields.next()?.parse().ok()?;
                 let model = fields.next()?.parse().ok()?;
-                let commit = match fields.next()? { "0" => false, "1" => true, _ => return None };
                 if fields.next().is_some() || !body.is_empty() || !valid_id(source) {
                     return None;
                 }
                 self.reconcile(players, now);
-                self.transfer(id, source, handle, model, commit, players, now);
+                self.transfer(id, source, handle, model, players, now);
                 None
             }
             "LFWQ" => {

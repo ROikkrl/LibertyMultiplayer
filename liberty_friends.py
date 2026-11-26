@@ -19,7 +19,8 @@ STATE_META = re.compile(rb"~([0-9]{1,12}),([0-9]{1,12}),([01]),([0-3]),(-1|[0-9]
 COMBAT_META = re.compile(rb"!([0-7]),([0-9]{1,19}),([0-2]),(-|[0-9a-f]{16})")
 WORLD_PAGE_ROWS = 5
 WORLD_MAX_PAGES = 6
-VEHICLE_TAKE = re.compile(rb"t,([0-9a-f]{16}),(-?[0-9]{1,10}),(-?[0-9]{1,10}),([01])")
+VEHICLE_TAKE = re.compile(rb"t,([0-9a-f]{16}),(-?[0-9]{1,10}),(-?[0-9]{1,10})")
+TRAFFIC_KEY = re.compile(rb"[0-9a-f]{16}:v:-?[0-9]{1,10}:-?[0-9]{1,10}")
 WIRE_VERSION = VERSION.encode("ascii")
 VERSION_TOKEN = re.compile(rb"[0-9]+\.[0-9]+\.[0-9]+")
 
@@ -200,9 +201,10 @@ def serve(args):
                 if not fields or fields[0] != WIRE_VERSION:
                     sock.sendto(seal(args.key, b" ".join((b"LF-VERSION", challenge, WIRE_VERSION))), address)
                     continue
-                if len(fields) < 2 or not fields[1].isdigit() or not 1 <= int(fields[1]) <= 99:
+                if (len(fields) < 4 or not fields[1].isdigit() or not 1 <= int(fields[1]) <= 99 or
+                        not fields[2].isdigit() or (fields[3] != b"-" and not TRAFFIC_KEY.fullmatch(fields[3]))):
                     continue
-                fields = fields[2:]
+                fields = fields[4:]
                 position = coordinates(fields).split(b" !", 1)[0]
             except ValueError:
                 continue
@@ -352,10 +354,13 @@ def join(args, stop=None, report=print):
                         world.pause()
                         sock.send(leave_packet)
                 elif position.endswith(b"\n") and started - last_change < TIMEOUT:
-                    tick, *fields = position.split()
+                    tick, play, vehicle, *fields = position.split()
+                    if not play.isdigit() or (vehicle != b"-" and not TRAFFIC_KEY.fullmatch(vehicle)):
+                        raise ValueError("unrecognized game state")
                     sample = str(int(tick)).encode("ascii")
                     challenge = secrets.token_hex(8).encode("ascii")
-                    payload = b" ".join((b"LF1", player_id, challenge, WIRE_VERSION, power, coordinates(fields)))
+                    payload = b" ".join((b"LF1", player_id, challenge, WIRE_VERSION, power, play, vehicle,
+                                         coordinates(fields)))
                     next_status = "Waiting for the server"
                     sock.send(seal(args.key, payload))
                     deadline = started + 0.15
@@ -372,13 +377,14 @@ def join(args, stop=None, report=print):
                             continue
                         header, _, rows = response.partition(b"\n")
                         fields = header.split()
-                        if not fields or fields[0] != challenge or len(fields) not in (1, 2, 5):
+                        if not fields or fields[0] != challenge or len(fields) not in (1, 2, 7):
                             continue
                         if len(fields) >= 2 and fields[1] != b"-" and not PLAYER_ID.fullmatch(fields[1]):
                             continue
-                        if len(fields) == 5 and (
+                        if len(fields) == 7 and (
                             not fields[2].isdigit() or not fields[3].isdigit() or
-                            fields[4] not in (b"0", b"1", b"2", b"3")
+                            fields[4] not in (b"0", b"1", b"2", b"3") or
+                            not all(re.fullmatch(rb"-?[0-9]{1,3}", value) for value in fields[5:])
                         ):
                             continue
                         bridge_header = str(time.monotonic_ns()).encode()

@@ -26,6 +26,7 @@ struct Player {
     joined: Instant,
     seen: Instant,
     power: u8,
+    play_millis: u32,
     address: SocketAddr,
     modern: bool,
     shares_world: bool,
@@ -35,6 +36,7 @@ struct Player {
     vehicle_token: i32,
     vehicle_model: i32,
     owned_vehicle: Option<(i32, i32)>,
+    vehicle_origin: Option<String>,
     seated: bool,
     combat: Option<CombatInput>,
     result: CombatResult,
@@ -54,6 +56,7 @@ struct CombatResult {
     acknowledged: u64,
     damage: u32,
     hit_kind: u8,
+    impulse: [i16; 2],
     hit_until: Option<Instant>,
     last_attack: Option<Instant>,
     last_ram: Option<Instant>,
@@ -64,6 +67,7 @@ struct Update<'a> {
     challenge: &'a str,
     player: Player,
     target: &'a str,
+    vehicle_claim: &'a str,
 }
 
 fn valid_id(value: &str) -> bool {
@@ -110,6 +114,11 @@ fn parse_update(payload: &str, now: Instant, address: SocketAddr) -> Option<Upda
     }
     let power: u8 = fields.next()?.parse().ok()?;
     if !(1..=99).contains(&power) {
+        return None;
+    }
+    let play_millis = fields.next()?.parse::<u32>().ok()?.min(3_600_000);
+    let vehicle_claim = fields.next()?;
+    if vehicle_claim != "-" && world::traffic_key(vehicle_claim).is_none() {
         return None;
     }
     let position = [
@@ -251,9 +260,10 @@ fn parse_update(payload: &str, now: Instant, address: SocketAddr) -> Option<Upda
     } else {
         None
     };
-    Some(Update { id: player, challenge, target, player: Player {
-        state, joined: now, seen: now, power, address, modern: metadata.is_some(), shares_world, position, sample,
+    Some(Update { id: player, challenge, target, vehicle_claim, player: Player {
+        state, joined: now, seen: now, power, play_millis, address, modern: metadata.is_some(), shares_world, position, sample,
         driving, vehicle_token, vehicle_model, owned_vehicle: driving.then_some((vehicle_token, vehicle_model)),
+        vehicle_origin: None,
         seated, combat, result: CombatResult::default(),
     } })
 }
@@ -266,7 +276,7 @@ fn distance_squared(a: Position, b: Position) -> f64 {
     (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)
 }
 
-fn ram_speed(previous: (Position, u64), new: &Player, victim: Position) -> Option<f64> {
+fn ram_contact(previous: (Position, u64), new: &Player, victim: Position) -> Option<(f64, [i16; 2])> {
     let milliseconds = new.sample.checked_sub(previous.1)?;
     if !(15..=300).contains(&milliseconds) {
         return None;
@@ -277,13 +287,17 @@ fn ram_speed(previous: (Position, u64), new: &Player, victim: Position) -> Optio
     let dy = b[1] - a[1];
     let length_squared = dx * dx + dy * dy;
     let speed = length_squared.sqrt() * 1_000.0 / milliseconds as f64;
-    if !(5.0..=100.0).contains(&speed) {
+    if !(3.5..=100.0).contains(&speed) {
         return None;
     }
-    let t = (((victim[0] - a[0]) * dx + (victim[1] - a[1]) * dy) / length_squared).clamp(0.0, 1.0);
-    let z = a[2] + (b[2] - a[2]) * t;
+    let length = length_squared.sqrt();
+    let toward = ((victim[0] - a[0]) * dx + (victim[1] - a[1]) * dy) / length_squared;
+    let t = toward.clamp(-0.3 / length, 1.0 + 2.0 / length);
+    let z = a[2] + (b[2] - a[2]) * t.clamp(0.0, 1.0);
     let lateral = (victim[0] - a[0] - dx * t).powi(2) + (victim[1] - a[1] - dy * t).powi(2);
-    (lateral <= 1.55_f64.powi(2) && (z - victim[2]).abs() <= 1.5).then_some(speed)
+    let kick = (speed * 12.0).clamp(65.0, 280.0);
+    (lateral <= 1.5_f64.powi(2) && (z - victim[2]).abs() <= 1.6)
+        .then_some((speed, [(dx / length * kick) as i16, (dy / length * kick) as i16]))
 }
 
 fn ready(previous: Option<Instant>, now: Instant, millis: u64) -> bool {
@@ -295,10 +309,11 @@ fn eligible(player: &Player, now: Instant) -> bool {
         now.duration_since(player.seen) < Duration::from_millis(800)
 }
 
-fn apply_hit(player: &mut Player, kind: u8, damage: u32, now: Instant) {
+fn apply_hit(player: &mut Player, kind: u8, damage: u32, impulse: [i16; 2], now: Instant) {
     player.result.damage = player.result.damage.saturating_add(damage);
     player.result.hit_kind = kind;
-    player.result.hit_until = Some(now + Duration::from_millis(if kind == 3 { 1300 } else { 650 }));
+    player.result.impulse = impulse;
+    player.result.hit_until = Some(now + Duration::from_millis(if kind == 3 { 1700 } else { 650 }));
     if kind == 3 {
         player.result.last_ram = Some(now);
     }
@@ -319,7 +334,7 @@ fn simulate_hits(players: &mut HashMap<String, Player>, id: &str, target: &str,
                 let range = if input.kind == 1 { 3.2_f64 } else { 180.0_f64 };
                 if let Some(victim) = players.get_mut(target) {
                     if eligible(victim, now) && distance_squared(origin, victim.position) <= range.powi(2) {
-                        apply_hit(victim, input.kind, if input.kind == 1 { 12 } else { 24 }, now);
+                        apply_hit(victim, input.kind, if input.kind == 1 { 12 } else { 24 }, [0; 2], now);
                         event(log, &format!("pvp_hit kind={} source={id} target={target}", input.kind));
                     }
                 }
@@ -336,11 +351,11 @@ fn simulate_hits(players: &mut HashMap<String, Player>, id: &str, target: &str,
                 !ready(victim.result.last_ram, now, 1600) {
                 return None;
             }
-            ram_speed(previous, driver, victim.position).map(|speed| (peer_id.clone(), speed))
+            ram_contact(previous, driver, victim.position).map(|hit| (peer_id.clone(), hit))
         }).collect();
-        for (peer, speed) in hits {
+        for (peer, (speed, impulse)) in hits {
             apply_hit(players.get_mut(&peer).expect("victim exists"), 3,
-                (speed * 2.0).round().clamp(10.0, 75.0) as u32, now);
+                (speed * 2.0).round().clamp(10.0, 75.0) as u32, impulse, now);
             event(log, &format!("pvp_hit kind=3 source={id} target={peer}"));
         }
     }
@@ -440,19 +455,36 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: Option<fs::File>) -> io:
             }
             continue;
         }
-        let Update { id, challenge, target, player: update } = match parse_update(payload, now, sender) {
+        let Update { id, challenge, target, vehicle_claim, player: mut update } = match parse_update(payload, now, sender) {
             Some(update) => update,
             None => continue,
         };
+        if !players.contains_key(id) && players.len() >= MAX_PLAYERS {
+            continue;
+        }
+        if let Some(previous) = players.get(id) {
+            if previous.address != sender {
+                continue;
+            }
+            let advance = now.duration_since(previous.seen).as_millis().min(3000) as u32 + 75;
+            update.play_millis = update.play_millis.max(previous.play_millis)
+                .min(previous.play_millis.saturating_add(advance));
+            if update.owned_vehicle.is_none() || update.owned_vehicle == previous.owned_vehicle {
+                update.vehicle_origin = previous.vehicle_origin.clone();
+            }
+        }
+        if update.driving && vehicle_claim != "-" {
+            if !world.commit_driving(id, vehicle_claim, &update, now) {
+                continue;
+            }
+            update.vehicle_origin = Some(vehicle_claim.to_owned());
+        }
 
         let modern = update.modern;
         let modern_combat = update.combat.is_some();
         let region = sector(update.position);
         let mut previous = None;
         if let Some(player) = players.get_mut(id) {
-            if player.address != sender {
-                continue;
-            }
             if player.driving && update.driving && player.vehicle_token == update.vehicle_token {
                 previous = Some((player.position, player.sample));
             }
@@ -479,8 +511,8 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: Option<fs::File>) -> io:
         snapshot.clear();
         if modern_combat {
             let local = &players[id].result;
-            writeln!(&mut snapshot, "{challenge} {owner} {} {} {}", local.acknowledged,
-                local.damage, local.hit_kind).expect("writing to String");
+            writeln!(&mut snapshot, "{challenge} {owner} {} {} {} {} {}", local.acknowledged,
+                local.damage, local.hit_kind, local.impulse[0], local.impulse[1]).expect("writing to String");
         } else if modern {
             writeln!(&mut snapshot, "{challenge} {owner}").expect("writing to String");
         } else {
@@ -496,22 +528,21 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: Option<fs::File>) -> io:
                 &peer.state
             };
             write!(&mut snapshot, "{peer_id} ").expect("writing to String");
-            if peer_id == owner {
-                snapshot.push_str(state);
-            } else {
-                for (index, field) in state.split_ascii_whitespace().enumerate() {
-                    if index != 0 {
-                        snapshot.push(' ');
-                    }
-                    snapshot.push_str(if index == 8 { "-" } else { field });
+            for (index, field) in state.split_ascii_whitespace().enumerate() {
+                if index != 0 {
+                    snapshot.push(' ');
                 }
+                snapshot.push_str(if index == 8 { "-" } else { field });
             }
             if modern_combat {
                 if let Some(input) = peer.combat {
                     let ragdoll = input.ragdoll || peer.result.hit_until.map_or(false, |time| time > now);
                     let flags = u8::from(input.enabled) | (u8::from(ragdoll) << 1) |
                         (u8::from(input.dead) << 2);
-                    write!(&mut snapshot, " !{flags}").expect("writing to String");
+                    let origin = peer.vehicle_origin.as_deref().unwrap_or("-");
+                    write!(&mut snapshot, " !{flags},{},{},{},{},{origin}", peer.result.damage,
+                        peer.result.hit_kind, peer.result.impulse[0], peer.result.impulse[1])
+                        .expect("writing to String");
                 }
             }
             snapshot.push('\n');
