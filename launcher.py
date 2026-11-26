@@ -49,6 +49,8 @@ class Launcher:
                 )
         self.install_button = ttk.Button(panel, text="Выбрать и установить", command=self.browse)
         self.install_button.grid(row=0, column=2, padx=(8, 0))
+        self.patch_button = ttk.Button(panel, text="Патчить выбранную папку", command=self.patch_selected)
+        self.patch_button.grid(row=1, column=2, padx=(8, 0))
         self.button = ttk.Button(panel, text="Подключиться", command=self.toggle)
         self.button.grid(row=4, column=1, sticky="w", pady=(10, 4))
         self.check_button = ttk.Button(panel, text="Проверить сервер", command=self.probe)
@@ -122,13 +124,26 @@ class Launcher:
             self.check_results.put(f"Сервер доступен. Ключ принят. Задержка: {latency} мс.")
 
     def browse(self):
-        selected = filedialog.askdirectory()
+        selected = filedialog.askdirectory(initialdir=self.folder.get().strip() or None)
         if selected:
-            self.installing = True
-            self.install_button.config(state="disabled")
-            self.button.config(state="disabled")
-            self.status.set("Устанавливаю мод и зависимости…")
-            threading.Thread(target=self.install_game, args=(Path(selected),), daemon=True).start()
+            self.start_install(Path(selected))
+
+    def patch_selected(self):
+        selected = self.folder.get().strip().strip('"')
+        if not selected:
+            self.status.set("Укажи путь к папке GTA IV.")
+            return
+        self.start_install(Path(selected))
+
+    def start_install(self, selected):
+        if self.installing or self.worker is not None:
+            return
+        self.installing = True
+        self.install_button.config(state="disabled")
+        self.patch_button.config(state="disabled")
+        self.button.config(state="disabled")
+        self.status.set("Проверяю папку и обновляю мод…")
+        threading.Thread(target=self.install_game, args=(selected,), daemon=True).start()
 
     def install_game(self, selected):
         try:
@@ -160,6 +175,7 @@ class Launcher:
                                   mod_dir=game / "mods" / "LibertyFriends")
         self.stop.clear()
         self.install_button.config(state="disabled")
+        self.patch_button.config(state="disabled")
         self.button.config(text="Отключиться")
         self.status.set("Подключение…")
         self.worker = threading.Thread(target=self.connect, args=(args,), daemon=True)
@@ -186,6 +202,7 @@ class Launcher:
             self.status.set(message)
             self.installing = False
             self.install_button.config(state="normal")
+            self.patch_button.config(state="normal")
             self.button.config(state="normal")
         while not self.messages.empty():
             message, finished = self.messages.get_nowait()
@@ -200,6 +217,7 @@ class Launcher:
                 self.worker = None
                 self.button.config(text="Подключиться", state="normal")
                 self.install_button.config(state="normal")
+                self.patch_button.config(state="normal")
         self.root.after(100, self.refresh)
 
     def check_updates(self):

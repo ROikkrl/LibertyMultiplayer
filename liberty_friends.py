@@ -13,9 +13,21 @@ PACKET_LIMIT = 1200
 PLAYER_ID = re.compile(rb"[0-9a-f]{16}")
 RIDE_ID = re.compile(rb"(?:-|[0-9a-f]{16}:-?[0-9]{1,10})")
 WORLD_ENTITY = re.compile(rb"(?:p(?:,-?[0-9]{1,11}){6}|v(?:,-?[0-9]{1,11}){6}(?:,-?[0-9]{1,4}){0,4})")
+STATE_META = re.compile(rb"~([0-9]{1,12}),([0-9]{1,12}),([01]),([0-3]),(-1|[0-9]{1,3}),(-|[A-Za-z0-9_]{1,32})")
 
 
 def coordinates(fields):
+    metadata = b""
+    metadata_field = None
+    if fields and fields[-1].startswith(b"~"):
+        metadata_field = fields[-1]
+        match = STATE_META.fullmatch(fields[-1])
+        if not match or not -1 <= int(match[5]) <= 255:
+            raise ValueError("invalid state metadata")
+        metadata = b" " + fields[-1]
+        fields = fields[:-1]
+        if len(fields) < 9:
+            raise ValueError("metadata requires entity state")
     if len(fields) not in (3, 8, 9, 10, 11):
         raise ValueError("expected three coordinates")
     values = tuple(map(float, fields[:3]))
@@ -55,9 +67,15 @@ def coordinates(fields):
         if not -1 <= station <= 19:
             raise ValueError("invalid radio station")
         state += f" {station}".encode("ascii")
-    if len(state) > 360:
+    if len(state) + len(metadata) > 360:
+        if len(fields) >= 9 and fields[8] != b"-":
+            fields = list(fields)
+            fields[8] = fields[8].rpartition(b";")[0] or b"-"
+            if metadata_field is not None:
+                fields.append(metadata_field)
+            return coordinates(fields)
         raise ValueError("entity state is too large")
-    return state
+    return state + metadata
 
 
 def seal(key, payload):
@@ -87,6 +105,7 @@ def check_server(host, port, key):
 
 def serve(args):
     players = {}
+    world_owner = None
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.bind((args.bind, args.port))
         sock.settimeout(0.5)
@@ -120,8 +139,14 @@ def serve(args):
             if player_id not in players:
                 print(f"Connected {player_id.decode()} ({len(players)+1}/{MAX_PLAYERS})", flush=True)
             players[player_id] = (now, position)
-            rows = [challenge]
-            rows.extend(peer + b" " + data[1] for peer, data in players.items() if peer != player_id)
+            metadata = position.rpartition(b" ~")[2] if b" ~" in position else None
+            candidates = [peer for peer, (_, state) in players.items()
+                          if b" ~" in state and state.rpartition(b" ~")[2].split(b",")[2] == b"1"]
+            if world_owner not in candidates:
+                world_owner = min(candidates, default=None)
+            rows = [challenge + b" " + (world_owner or b"-") if metadata is not None else challenge]
+            rows.extend(peer + b" " + (data[1] if metadata is not None else data[1].split(b" ~", 1)[0])
+                        for peer, data in players.items() if peer != player_id)
             sock.sendto(seal(args.key, b"\n".join(rows) + b"\n"), address)
 
 
@@ -162,9 +187,13 @@ def join(args, stop=None, report=print):
                     sock.settimeout(max(0.001, deadline - time.monotonic()))
                     response = open_packet(args.key, sock.recv(65535))
                     header, _, rows = response.partition(b"\n")
-                    if header != challenge:
+                    received, _, owner = header.partition(b" ")
+                    if received != challenge or (owner and owner != b"-" and not PLAYER_ID.fullmatch(owner)):
                         continue
-                    temporary_file.write_bytes(str(time.monotonic_ns()).encode() + b"\n" + rows)
+                    bridge_header = str(time.monotonic_ns()).encode()
+                    if owner:
+                        bridge_header += b" " + owner
+                    temporary_file.write_bytes(bridge_header + b"\n" + rows)
                     temporary_file.replace(peer_file)
                     next_status = f"Connected — other players: {len(rows.splitlines())}"
                     break

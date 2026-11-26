@@ -19,6 +19,8 @@ const PLAYER_TIMEOUT: Duration = Duration::from_secs(3);
 struct Player {
     state: String,
     seen: Instant,
+    modern: bool,
+    shares_world: bool,
 }
 
 fn valid_id(value: &str) -> bool {
@@ -42,7 +44,11 @@ fn authenticate<'a>(packet: &'a [u8], signer: &PacketMac) -> Option<&'a str> {
     std::str::from_utf8(payload).ok()
 }
 
-fn parse_update(payload: &str) -> Option<(&str, &str, String)> {
+fn parse_update(payload: &str) -> Option<(&str, &str, String, bool, bool)> {
+    let (payload, metadata) = match payload.rsplit_once(" ~") {
+        Some((state, meta)) => (state, Some(meta)),
+        None => (payload, None),
+    };
     let mut fields = payload.split_ascii_whitespace();
     if fields.next()? != "LF1" {
         return None;
@@ -130,10 +136,39 @@ fn parse_update(payload: &str) -> Option<(&str, &str, String)> {
             }
         }
     }
+    let mut shares_world = false;
+    if let Some(meta) = metadata {
+        if state.split_ascii_whitespace().count() < 9 {
+            return None;
+        }
+        let mut parts = meta.split(',');
+        for _ in 0..2 {
+            let value = parts.next()?;
+            if value.is_empty() || value.len() > 12 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+        }
+        shares_world = match parts.next()? {
+            "0" => false,
+            "1" => true,
+            _ => return None,
+        };
+        if !matches!(parts.next()?, "0" | "1" | "2" | "3") {
+            return None;
+        }
+        let station: i16 = parts.next()?.parse().ok()?;
+        let name = parts.next()?;
+        if !(-1..=255).contains(&station) || name.is_empty() || name.len() > 32 ||
+            (name != "-" && !name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')) ||
+            parts.next().is_some() {
+            return None;
+        }
+        write!(&mut state, " ~{meta}").ok()?;
+    }
     if fields.next().is_some() || state.len() > 360 {
         return None;
     }
-    Some((player, challenge, state))
+    Some((player, challenge, state, metadata.is_some(), shares_world))
 }
 
 fn event(log: &mut Option<fs::File>, message: &str) {
@@ -169,6 +204,7 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: Option<fs::File>) -> io:
     let mut incoming = [0u8; 65_536];
     let mut outgoing = [0u8; PACKET_LIMIT];
     let mut snapshot = String::with_capacity(PACKET_LIMIT - SIGNATURE_LEN);
+    let mut world_owner: Option<String> = None;
     loop {
         let now = Instant::now();
         players.retain(|id, player| {
@@ -195,28 +231,48 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: Option<fs::File>) -> io:
             }
             continue;
         }
-        let (id, challenge, state) = match parse_update(payload) {
+        let (id, challenge, state, modern, shares_world) = match parse_update(payload) {
             Some(update) => update,
             None => continue,
         };
 
         let now = Instant::now();
+        let update = Player { state, seen: now, modern, shares_world };
         if let Some(player) = players.get_mut(id) {
-            *player = Player { state, seen: now };
+            *player = update;
         } else if players.len() < MAX_PLAYERS {
-            players.insert(id.to_owned(), Player { state, seen: now });
+            players.insert(id.to_owned(), update);
             event(&mut log, &format!("connect player={id} online={}/{}", players.len(), MAX_PLAYERS));
         } else {
             continue;
         }
 
+        if !world_owner.as_deref().and_then(|owner| players.get(owner))
+            .map_or(false, |owner| owner.shares_world) {
+            let next = players.iter().filter(|(_, peer)| peer.shares_world)
+                .map(|(id, _)| id).min().cloned();
+            if world_owner != next {
+                event(&mut log, &format!("world_owner={}", next.as_deref().unwrap_or("-")));
+                world_owner = next;
+            }
+        }
         snapshot.clear();
-        writeln!(&mut snapshot, "{challenge}").expect("writing to String");
+        if modern {
+            writeln!(&mut snapshot, "{challenge} {}", world_owner.as_deref().unwrap_or("-"))
+                .expect("writing to String");
+        } else {
+            writeln!(&mut snapshot, "{challenge}").expect("writing to String");
+        }
         for (peer_id, peer) in &players {
             if peer_id == id {
                 continue;
             }
-            writeln!(&mut snapshot, "{peer_id} {}", peer.state).expect("writing to String");
+            let state = if !modern && peer.modern {
+                peer.state.split_once(" ~").map_or(peer.state.as_str(), |(old, _)| old)
+            } else {
+                &peer.state
+            };
+            writeln!(&mut snapshot, "{peer_id} {state}").expect("writing to String");
         }
         reply(&socket, &signer, snapshot.as_bytes(), sender, &mut outgoing, &mut log);
     }
