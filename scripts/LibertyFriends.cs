@@ -29,6 +29,15 @@ public sealed class LibertyFriends : Script
         public int TireMask = -1;
     }
 
+    private sealed class AvatarGait
+    {
+        public Vector3 Sample;
+        public long SampleAt;
+        public long CheckAt;
+        public float Speed;
+        public int Clip = -1;
+    }
+
     private readonly Dictionary<string, Blip> markers = new Dictionary<string, Blip>();
     private readonly Dictionary<string, Vector3> positions = new Dictionary<string, Vector3>();
     private readonly Dictionary<string, Ped> avatars = new Dictionary<string, Ped>();
@@ -57,14 +66,12 @@ public sealed class LibertyFriends : Script
     private readonly Dictionary<string, Vector3> worldTargets = new Dictionary<string, Vector3>();
     private readonly Dictionary<string, Quaternion> worldOrientations = new Dictionary<string, Quaternion>();
     private readonly Dictionary<string, float> worldHeadings = new Dictionary<string, float>();
-    private readonly Dictionary<string, int> avatarMotion = new Dictionary<string, int>();
-    private readonly Dictionary<string, Vector3> previousAvatarTargets = new Dictionary<string, Vector3>();
-    private readonly Dictionary<string, long> avatarMotionTimes = new Dictionary<string, long>();
+    private readonly Dictionary<string, AvatarGait> avatarGaits = new Dictionary<string, AvatarGait>();
     private static readonly VehicleWheel[] replicatedWheels = {
         VehicleWheel.FrontLeft, VehicleWheel.FrontRight, VehicleWheel.RearLeft, VehicleWheel.RearRight
     };
-    private readonly AnimationSet walkAnimation = new AnimationSet("amb@hurry_walk");
-    private readonly AnimationSet runAnimation = new AnimationSet("amb@flee_a");
+    private readonly AnimationSet playerMovement = new AnimationSet("move_player");
+    private static readonly string[] gaitClips = { "idle", "walk", "run", "sprint" };
     private string tunedRide = "-";
     private int tunedStation = -1;
 
@@ -252,9 +259,7 @@ public sealed class LibertyFriends : Script
             {
                 if (Exists(avatars[id])) avatars[id].Delete();
                 avatars.Remove(id);
-                avatarMotion.Remove(id);
-                previousAvatarTargets.Remove(id);
-                avatarMotionTimes.Remove(id);
+                avatarGaits.Remove(id);
             }
         }
         if (!reportedPeers && seen.Count > 0)
@@ -419,6 +424,7 @@ public sealed class LibertyFriends : Script
         {
             if (Exists(avatar)) avatar.Delete();
             avatars.Remove(id);
+            avatarGaits.Remove(id);
             return;
         }
         if (Exists(avatar) || clock.ElapsedMilliseconds < nextAvatarSpawn) return;
@@ -510,35 +516,45 @@ public sealed class LibertyFriends : Script
         if (!avatars.TryGetValue(id, out avatar) || !Exists(avatar) ||
             peer.CarId != null || peer.Ride != "-" || Exists(avatar.CurrentVehicle))
         {
-            avatarMotion.Remove(id);
-            previousAvatarTargets.Remove(id);
-            avatarMotionTimes.Remove(id);
+            avatarGaits.Remove(id);
             return;
         }
-        Vector3 previous;
         long now = clock.ElapsedMilliseconds;
-        int motion = 0;
-        if (previousAvatarTargets.TryGetValue(id, out previous))
+        AvatarGait gait;
+        if (!avatarGaits.TryGetValue(id, out gait))
         {
-            float dx = previous.X - peer.Position.X, dy = previous.Y - peer.Position.Y;
-            float distance = dx * dx + dy * dy;
-            long elapsed = now - avatarMotionTimes[id];
-            if (distance < 0.0004f && elapsed < 180) return;
-            if (distance >= 0.0004f && distance < 9f && elapsed < 300)
-            {
-                float speed = (float)Math.Sqrt(distance) * 1000 / Math.Max(25, elapsed);
-                if (speed > 2.7f) motion = 2;
-                else if (speed > 0.3f) motion = 1;
-            }
+            gait = new AvatarGait { Sample = peer.Position, SampleAt = now };
+            avatarGaits[id] = gait;
         }
-        previousAvatarTargets[id] = peer.Position;
-        avatarMotionTimes[id] = now;
-        int oldMotion;
-        if (avatarMotion.TryGetValue(id, out oldMotion) && oldMotion == motion) return;
-        avatarMotion[id] = motion;
-        if (motion == 0) avatar.Task.ClearAll();
-        else if (motion == 1) avatar.Task.PlayAnimation(walkAnimation, "walk_a", 1f, AnimationFlags.Unknown01);
-        else avatar.Task.PlayAnimation(runAnimation, "run_flee_lookaround_b", 1f, AnimationFlags.Unknown01);
+        float dx = gait.Sample.X - peer.Position.X, dy = gait.Sample.Y - peer.Position.Y;
+        float distance = dx * dx + dy * dy;
+        long elapsed = now - gait.SampleAt;
+        if (elapsed >= 60 && (distance >= 0.0025f || elapsed >= 200))
+        {
+            if (distance >= 0.0025f && distance < 9f && elapsed < 350)
+            {
+                float measured = (float)Math.Sqrt(distance) * 1000 / elapsed;
+                gait.Speed = gait.Speed * 0.4f + measured * 0.6f;
+            }
+            else gait.Speed = 0;
+            gait.Sample = peer.Position;
+            gait.SampleAt = now;
+        }
+
+        // Hysteresis avoids switching back and forth near a gait boundary.
+        int motion = gait.Speed >= (gait.Clip == 3 ? 4.7f : 5.4f) ? 3
+            : gait.Speed >= (gait.Clip >= 2 ? 2.2f : 2.8f) ? 2
+            : gait.Speed >= (gait.Clip >= 1 ? 0.25f : 0.45f) ? 1 : 0;
+        string clip = gaitClips[motion];
+        if (motion == gait.Clip)
+        {
+            if (now < gait.CheckAt) return;
+            gait.CheckAt = now + 750;
+            if (playerMovement.isInMemory && playerMovement.isPedPlayingAnimation(avatar, clip)) return;
+        }
+        gait.Clip = motion;
+        gait.CheckAt = now + 750;
+        avatar.Task.PlayAnimation(playerMovement, clip, 1f, AnimationFlags.Unknown01);
     }
 
     private void TunePassengerRadio(Ped character)
@@ -762,9 +778,7 @@ public sealed class LibertyFriends : Script
         foreach (Ped avatar in avatars.Values)
             if (Exists(avatar)) avatar.Delete();
         avatars.Clear();
-        avatarMotion.Clear();
-        previousAvatarTargets.Clear();
-        avatarMotionTimes.Clear();
+        avatarGaits.Clear();
         foreach (string id in new List<string>(cars.Keys)) RemoveCar(id);
         peers.Clear();
         UpdateWorld(null);
