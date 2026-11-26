@@ -5,4 +5,6 @@ peers.tmp
 work/
 outputs/
 player.txt
+bridge-live.txt
+bridge-*.tmp
 client.log

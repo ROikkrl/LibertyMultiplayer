@@ -152,7 +152,7 @@ class Launcher:
             self.install_results.put((None, str(error)))
         else:
             game, backup = result
-            message = "Готово. Запусти GTA IV, загрузи сохранение и нажми F9."
+            message = "Готово. Подключись к серверу и загрузи сохранение в GTA IV."
             if backup:
                 message += f" Резервная копия: {backup.name}"
             self.install_results.put((game, message))
@@ -209,7 +209,7 @@ class Launcher:
             if message.startswith("Connected"):
                 message = "Подключено. Других игроков: " + message.rsplit(" ", 1)[-1]
             elif message.startswith("Waiting for GTA IV"):
-                message = "Загрузи сейв в GTA IV и нажми F9."
+                message = "Загрузи сохранение в GTA IV. Синхронизация запустится автоматически."
             elif message == "Waiting for the server":
                 message = "Ожидание ответа от сервера."
             self.status.set(message)

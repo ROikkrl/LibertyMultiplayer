@@ -102,14 +102,13 @@ public sealed class LibertyFriends : Script
     private readonly Stopwatch clock = Stopwatch.StartNew();
     private readonly string directory;
     private bool active;
-    private bool experimentalEntities;
-    private bool experimentalWorld;
-    private bool combatEnabled;
+    private bool serverConnected;
     private bool reportedPeers;
     private string lastSnapshot;
     private long lastUpdate;
     private long nextSample;
     private long lastFrame;
+    private long nextBridgeCheck;
     private string ownId = "";
     private string ride = "-";
     private Vehicle drivingCar;
@@ -152,73 +151,84 @@ public sealed class LibertyFriends : Script
         string game = Path.GetDirectoryName(Process.GetCurrentProcess().MainModule.FileName);
         directory = Path.Combine(game, "mods", "LibertyFriends");
         Interval = 0;
-        KeyDown += Toggle;
+        KeyDown += HandleKey;
         Tick += Update;
+        Trace("mod loaded; waiting for launcher and a loaded save");
     }
 
-    private void Toggle(object sender, GTA.KeyEventArgs e)
+    private void HandleKey(object sender, GTA.KeyEventArgs e)
     {
-        if (active && e.Key == Keys.F11)
+        if (active && serverConnected && e.Key == Keys.F10) ToggleRide();
+    }
+
+    private void CheckLauncher()
+    {
+        string lease = Path.Combine(directory, "bridge-live.txt");
+        try
         {
-            experimentalEntities = !experimentalEntities;
-            Trace(experimentalEntities ? "experimental entities enabled" : "experimental entities disabled");
-            if (!experimentalEntities)
-            {
-                experimentalWorld = false;
-                combatEnabled = false;
-                ClearMarkers();
-            }
-            lastSnapshot = null;
-            Game.DisplayText(experimentalEntities ? "Liberty Friends: experimental 3D" : "Liberty Friends: map only");
-            return;
+            double age = (DateTime.UtcNow - File.GetLastWriteTimeUtc(lease)).TotalMilliseconds;
+            string id = age >= -1000 && age <= 3500 ? File.ReadAllText(lease).Trim() : "";
+            if (id != "" && (id.Length != 16 ||
+                Array.Exists(id.ToCharArray(), c => !(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f'))))
+                return;
+            if (id == ownId) return;
+            StopSynchronization(id == "" ? "launcher stopped" : "launcher changed");
+            ownId = id;
+            if (id != "") Trace("launcher detected; waiting for a loaded save");
         }
-        if (active && experimentalEntities && e.Key == Keys.F8)
+        catch (IOException)
         {
-            experimentalWorld = !experimentalWorld;
-            if (!experimentalWorld) UpdateWorld(null);
-            ResetWorldSource();
-            Trace(experimentalWorld ? "experimental world enabled" : "experimental world disabled");
-            Game.DisplayText(experimentalWorld ? "Liberty Friends: world ON" : "Liberty Friends: world OFF");
-            return;
+            // A launcher update may briefly hold the lease file.
         }
-        if (active && experimentalEntities && e.Key == Keys.F10)
-        {
-            ToggleRide();
-            return;
-        }
-        if (active && experimentalEntities && e.Key == Keys.F7)
-        {
-            combatEnabled = !combatEnabled;
-            if (!combatEnabled) ClearPendingAttack();
-            foreach (Vehicle car in cars.Values)
-                if (Exists(car)) GTA.Native.Function.Call("SET_CAR_COLLISION", car, !combatEnabled);
-            Trace(combatEnabled ? "pvp enabled" : "pvp disabled");
-            Game.DisplayText(combatEnabled ? "Liberty Friends: PvP ON" : "Liberty Friends: PvP OFF");
-            return;
-        }
-        if (e.Key != Keys.F9) return;
-        if (!active && (!Directory.Exists(directory) || !Player.CanControlCharacter)) return;
-        active = !active;
-        if (!active)
-        {
-            ClearMarkers();
-            experimentalEntities = false;
-            experimentalWorld = false;
-            combatEnabled = false;
-            ClearPendingAttack();
-            reportedPeers = false;
-        }
-        Trace(active ? "session enabled (map only)" : "session disabled");
-        Game.DisplayText(active ? "Liberty Friends: ON" : "Liberty Friends: OFF");
+    }
+
+    private void StopSynchronization(string reason)
+    {
+        if (!active) return;
+        active = false;
+        ResetConnection();
+        Trace("synchronization stopped: " + reason);
+    }
+
+    private void ResetConnection()
+    {
+        serverConnected = false;
+        combatHeaderSeen = false;
+        reportedPeers = false;
+        worldOwner = null;
+        drivingCar = null;
+        tunedRide = "-";
+        ClearPendingAttack();
+        ClearMarkers();
     }
 
     private void Update(object sender, EventArgs e)
     {
-        if (!active) return;
         long now = clock.ElapsedMilliseconds;
+        if (now >= nextBridgeCheck)
+        {
+            nextBridgeCheck = now + 300;
+            CheckLauncher();
+        }
+        if (ownId.Length == 0) return;
+        if (!active)
+        {
+            if (now < nextSample) return;
+            nextSample = now + 100;
+            if (!Player.CanControlCharacter || !Exists(Player.Character)) return;
+            active = true;
+            nextSample = now;
+            lastFrame = now;
+            Trace("save ready; sending local state and waiting for server");
+        }
         float step = Math.Min(1f, (now - lastFrame) / 80f);
         lastFrame = now;
         Ped character = Player.Character;
+        if (!Exists(character))
+        {
+            StopSynchronization("left gameplay");
+            return;
+        }
         if (now < nextSample)
         {
             MoveAvatars(step, now);
@@ -230,7 +240,7 @@ public sealed class LibertyFriends : Script
             if (Exists(character))
             {
                 Vector3 p = character.Position;
-                Vehicle car = experimentalEntities ? character.CurrentVehicle : null;
+                Vehicle car = character.CurrentVehicle;
                 bool driving = Exists(car) && Equals(car.GetPedOnSeat(VehicleSeat.Driver), character);
                 if (driving && !Equals(drivingCar, car))
                 {
@@ -243,22 +253,10 @@ public sealed class LibertyFriends : Script
                 Vehicle passengerCar;
                 if (ride != "-" && (!cars.TryGetValue(ride, out passengerCar) ||
                     !Exists(passengerCar) || !Equals(car, passengerCar))) ride = "-";
-                string identity = Path.Combine(directory, "player.txt");
-                if (File.Exists(identity))
-                {
-                    string id = File.ReadAllText(identity).Trim();
-                    if (id != ownId)
-                    {
-                        ownId = id;
-                        combatHeaderSeen = false;
-                        ClearPendingAttack();
-                    }
-                }
                 if (now >= nextWorldSample)
                 {
                     nextWorldSample = now + 67;
-                    bool publishWorld = experimentalWorld && worldOwner == ownId &&
-                        ownId.Length == 16 && peers.Count > 0;
+                    bool publishWorld = serverConnected && worldOwner == ownId && peers.Count > 0;
                     worldSample = publishWorld ? CaptureWorld(character, car) : "-";
                     worldSampleAt = now;
                 }
@@ -269,8 +267,7 @@ public sealed class LibertyFriends : Script
                 }
                 int flags = driving ? ((car.EngineRunning ? 1 : 0) | (car.SirenActive ? 2 : 0)) : 0;
                 CaptureCombat(character, now);
-                int combatFlags = (combatEnabled && experimentalEntities ? 1 : 0) |
-                    (experimentalEntities && character.isRagdoll ? 2 : 0) | (!character.isAlive ? 4 : 0);
+                int combatFlags = 1 | (character.isRagdoll ? 2 : 0) | (!character.isAlive ? 4 : 0);
                 string position = string.Format(CultureInfo.InvariantCulture,
                     "{0} {1:F2} {2:F2} {3:F2} {4:F2} {5} {6} {7} {8} {9}{10} ~{0},{11},{12},{13},{14},{15} !{16},{17},{18},{19}\n",
                     now, p.X, p.Y, p.Z,
@@ -278,7 +275,7 @@ public sealed class LibertyFriends : Script
                     character.Model.Hash, driving ? car.Model.Hash : 0, driving ? drivingToken : 0, ride, worldSample,
                     driving ? CaptureCarPhysics(car) + " " +
                         (sourceStation <= (int)RadioStation.Integrity ? sourceStation : -1).ToString(CultureInfo.InvariantCulture) : "",
-                    worldSampleAt, experimentalWorld ? 1 : 0, flags, driving ? sourceStation : -1,
+                    worldSampleAt, 1, flags, driving ? sourceStation : -1,
                     driving ? sourceStationName : "-", combatFlags, pendingAttack, pendingAttackKind, pendingVictim);
                 File.WriteAllText(Path.Combine(directory, "position.txt"), position);
             }
@@ -287,10 +284,15 @@ public sealed class LibertyFriends : Script
             if (File.Exists(path))
             {
                 string snapshot = File.ReadAllText(path);
-                if (snapshot != lastSnapshot && snapshot.EndsWith("\n", StringComparison.Ordinal))
+                if (snapshot != lastSnapshot && IsCurrentSnapshot(snapshot, path))
                 {
                     lastSnapshot = snapshot;
                     lastUpdate = now;
+                    if (!serverConnected)
+                    {
+                        serverConnected = true;
+                        Trace("server connected; synchronization enabled: map, avatars, vehicles, environment, radio, PvP and ragdoll");
+                    }
                     UpdateMarkers(snapshot, character);
                 }
             }
@@ -299,8 +301,21 @@ public sealed class LibertyFriends : Script
         {
             // The network client may be replacing the snapshot during this tick.
         }
-        if (now - lastUpdate > 2500) ClearMarkers();
+        if (serverConnected && now - lastUpdate > 2500)
+        {
+            ResetConnection();
+            Trace("server timed out; remote entities removed");
+        }
         MoveAvatars(step, now);
+    }
+
+    private bool IsCurrentSnapshot(string snapshot, string path)
+    {
+        int endOfHeader = snapshot.IndexOf(' ');
+        if (endOfHeader < 0 || !snapshot.EndsWith("\n", StringComparison.Ordinal) ||
+            !snapshot.Substring(0, endOfHeader).EndsWith(":" + ownId, StringComparison.Ordinal))
+            return false;
+        return (DateTime.UtcNow - File.GetLastWriteTimeUtc(path)).TotalMilliseconds <= 2500;
     }
 
     private void UpdateMarkers(string snapshot, Ped character)
@@ -358,12 +373,9 @@ public sealed class LibertyFriends : Script
             }
             if (metadata.StartsWith("~", StringComparison.Ordinal)) ReadMetadata(peer, metadata);
             peers[columns[0]] = peer;
-            if (experimentalEntities)
-            {
-                UpdateAvatar(columns[0], position, character, peer.PedModel);
-                PrepareCombatAvatar(columns[0], peer);
-                UpdateAvatarMotion(columns[0], peer);
-            }
+            UpdateAvatar(columns[0], position, character, peer.PedModel);
+            PrepareCombatAvatar(columns[0], peer);
+            UpdateAvatarMotion(columns[0], peer);
             Blip marker;
             if (markers.TryGetValue(columns[0], out marker) && Exists(marker))
             {
@@ -401,12 +413,9 @@ public sealed class LibertyFriends : Script
             reportedPeers = true;
             Trace("first peer snapshot received");
         }
-        if (experimentalEntities)
-        {
-            UpdateCars(character);
-            TunePassengerRadio(character);
-            if (experimentalWorld) UpdateWorld(character);
-        }
+        UpdateCars(character);
+        TunePassengerRadio(character);
+        UpdateWorld(character);
     }
 
     private void ClearPendingAttack()
@@ -418,7 +427,7 @@ public sealed class LibertyFriends : Script
 
     private void CaptureCombat(Ped character, long now)
     {
-        if (!combatEnabled || !experimentalEntities || !character.isAlive || character.isRagdoll)
+        if (!serverConnected || !character.isAlive || character.isRagdoll)
         {
             ClearPendingAttack();
             return;
@@ -453,7 +462,7 @@ public sealed class LibertyFriends : Script
     {
         Ped avatar;
         if (!avatars.TryGetValue(id, out avatar) || !Exists(avatar)) return;
-        bool vulnerable = combatEnabled && (peer.CombatFlags & 5) == 1;
+        bool vulnerable = (peer.CombatFlags & 5) == 1;
         if (vulnerable && vulnerableAvatars.Add(id))
         {
             avatar.MaxHealth = 1000;
@@ -483,7 +492,7 @@ public sealed class LibertyFriends : Script
             combatHeaderSeen = true;
             return;
         }
-        if (!combatEnabled || total == old || !Exists(character) || !character.isAlive) return;
+        if (total == old || !Exists(character) || !character.isAlive) return;
         int damage = (int)Math.Min(500u, total - old);
         GTA.Native.Function.Call("DAMAGE_CHAR", character, damage, true);
         if (character.isAlive && !character.isInVehicle() && !character.isRagdoll)
@@ -916,7 +925,7 @@ public sealed class LibertyFriends : Script
                 if (peer.Physics != null) car.RotationQuaternion = peer.Physics.Orientation;
                 else car.Heading = peer.Heading;
                 car.FreezePosition = true;
-                if (combatEnabled) GTA.Native.Function.Call("SET_CAR_COLLISION", car, false);
+                GTA.Native.Function.Call("SET_CAR_COLLISION", car, false);
                 cars[peer.CarId] = car;
                 appliedDamage.Remove(peer.CarId);
                 appliedVehicleFlags.Remove(peer.CarId);

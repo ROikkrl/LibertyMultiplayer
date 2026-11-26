@@ -170,8 +170,11 @@ def join(args, stop=None, report=print):
     local_file = directory / "position.txt"
     peer_file = directory / "peers.txt"
     temporary_file = directory / "peers.tmp"
+    bridge_file = directory / "bridge-live.txt"
     player_id = secrets.token_hex(8).encode("ascii")
     (directory / "player.txt").write_bytes(player_id)
+    bridge_temporary = directory / ("bridge-" + player_id.decode("ascii") + ".tmp")
+    next_heartbeat = 0.0
     try:
         last_position = local_file.read_bytes()
     except OSError:
@@ -182,7 +185,15 @@ def join(args, stop=None, report=print):
         status = None
         while stop is None or not stop.is_set():
             started = time.monotonic()
-            next_status = "Waiting for GTA IV — enable Liberty Friends with F9"
+            next_status = "Waiting for GTA IV"
+            if started >= next_heartbeat:
+                try:
+                    bridge_temporary.write_bytes(player_id)
+                    bridge_temporary.replace(bridge_file)
+                    next_heartbeat = started + 1
+                except OSError:
+                    # The game may have the file open briefly.
+                    next_heartbeat = started + INTERVAL
             try:
                 position = local_file.read_bytes()
                 if position != last_position:
@@ -212,7 +223,7 @@ def join(args, stop=None, report=print):
                         continue
                     bridge_header = str(time.monotonic_ns()).encode()
                     if len(fields) > 1:
-                        bridge_header += b" " + b" ".join(fields[1:])
+                        bridge_header += b":" + player_id + b" " + b" ".join(fields[1:])
                     temporary_file.write_bytes(bridge_header + b"\n" + rows)
                     temporary_file.replace(peer_file)
                     next_status = f"Connected — other players: {len(rows.splitlines())}"
