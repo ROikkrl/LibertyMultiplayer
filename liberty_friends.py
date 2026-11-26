@@ -8,15 +8,15 @@ from pathlib import Path
 
 MAX_PLAYERS = 4
 TIMEOUT = 3.0
-INTERVAL = 0.05
+INTERVAL = 1 / 30
 PACKET_LIMIT = 1200
 PLAYER_ID = re.compile(rb"[0-9a-f]{16}")
 RIDE_ID = re.compile(rb"(?:-|[0-9a-f]{16}:-?[0-9]{1,10})")
-WORLD_ENTITY = re.compile(rb"[pv](?:,-?[0-9]{1,11}){6}")
+WORLD_ENTITY = re.compile(rb"(?:p(?:,-?[0-9]{1,11}){6}|v(?:,-?[0-9]{1,11}){6}(?:,-?[0-9]{1,4}){0,4})")
 
 
 def coordinates(fields):
-    if len(fields) not in (3, 8, 9, 10):
+    if len(fields) not in (3, 8, 9, 10, 11):
         raise ValueError("expected three coordinates")
     values = tuple(map(float, fields[:3]))
     if not all(-20000 <= value <= 20000 for value in values):
@@ -35,19 +35,26 @@ def coordinates(fields):
     if len(fields) >= 9:
         world = fields[8]
         entities = world.split(b";")
-        if len(world) > 250 or (world != b"-" and
-                (len(entities) > 4 or not all(WORLD_ENTITY.fullmatch(item) for item in entities))):
+        if len(world) > 250 or (world != b"-" and (len(entities) > 4 or not all(
+                WORLD_ENTITY.fullmatch(item) and item.count(b",") in (6, 10) for item in entities))):
             raise ValueError("invalid world state")
         state += b" " + world
-    if len(fields) == 10:
+    if len(fields) >= 10:
         physics = fields[9]
         values = [float(value) for value in physics.split(b",")]
-        if (car == 0 or len(physics) > 80 or len(values) != 7 or
+        if (car == 0 or len(physics) > 80 or len(values) not in (7, 8) or
                 not 0.5 <= sum(value * value for value in values[:4]) <= 1.5 or
                 not -4000 <= values[4] <= 1000 or
                 not 0 <= values[5] <= 1000 or not -4000 <= values[6] <= 1000):
             raise ValueError("invalid vehicle physics")
+        if len(values) == 8 and not 0 <= int(physics.split(b",")[-1]) <= 15:
+            raise ValueError("invalid tire mask")
         state += b" " + physics
+    if len(fields) == 11:
+        station = int(fields[10])
+        if not -1 <= station <= 19:
+            raise ValueError("invalid radio station")
+        state += f" {station}".encode("ascii")
     if len(state) > 360:
         raise ValueError("entity state is too large")
     return state

@@ -89,7 +89,10 @@ fn parse_update(payload: &str) -> Option<(&str, &str, String)> {
                             return None;
                         }
                     }
-                    if parts.next().is_some() {
+                    let extra: Vec<&str> = parts.collect();
+                    if !extra.is_empty() && (!item.starts_with("v,") || extra.len() != 4 ||
+                        !extra.iter().all(|part| part.len() <= 5 &&
+                            part.parse::<i32>().map_or(false, |value| (-1000..=1000).contains(&value)))) {
                         return None;
                     }
                 }
@@ -105,6 +108,11 @@ fn parse_update(payload: &str) -> Option<(&str, &str, String)> {
                     *value = parts.next()?.parse().ok()?;
                 }
                 let length_squared: f64 = values[..4].iter().map(|value| value * value).sum();
+                if let Some(mask) = parts.next() {
+                    if !mask.parse::<u8>().map_or(false, |value| value <= 15) {
+                        return None;
+                    }
+                }
                 if parts.next().is_some() || !(0.5..=1.5).contains(&length_squared) ||
                     !(-4000.0..=1000.0).contains(&values[4]) ||
                     !(0.0..=1000.0).contains(&values[5]) ||
@@ -112,6 +120,13 @@ fn parse_update(payload: &str) -> Option<(&str, &str, String)> {
                     return None;
                 }
                 write!(&mut state, " {physics}").ok()?;
+                if let Some(station) = fields.next() {
+                    let index: i32 = station.parse().ok()?;
+                    if !(-1..=19).contains(&index) {
+                        return None;
+                    }
+                    write!(&mut state, " {index}").ok()?;
+                }
             }
         }
     }

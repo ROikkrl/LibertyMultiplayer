@@ -7,6 +7,7 @@ from pathlib import Path
 from tkinter import filedialog, ttk
 
 from installer import install
+from launcher_settings import load_settings, save_settings
 from liberty_friends import check_server, join
 from release_updates import VERSION, latest_update, repository
 
@@ -22,10 +23,12 @@ class Launcher:
         self.installing = False
         self.repo = repository()
         self.update_results = queue.Queue()
-        self.folder = tk.StringVar()
-        self.host = tk.StringVar(value="127.0.0.1")
-        self.port = tk.StringVar(value="24840")
-        self.key = tk.StringVar()
+        settings = load_settings()
+        self.folder = tk.StringVar(value=settings.get("folder", ""))
+        self.host = tk.StringVar(value=settings.get("host", "127.0.0.1"))
+        self.port = tk.StringVar(value=settings.get("port", "24840"))
+        self.key = tk.StringVar(value=settings.get("key", ""))
+        self.save_timer = None
         self.status = tk.StringVar(value="Закрой GTA IV и выбери папку игры для установки.")
         root.title(f"LibertyMultiplayer {VERSION}")
         panel = ttk.Frame(root, padding=18)
@@ -63,7 +66,21 @@ class Launcher:
             ttk.Button(panel, text="GitHub Releases", command=self.open_releases).grid(row=7, column=2)
             threading.Thread(target=self.check_updates, daemon=True).start()
         root.protocol("WM_DELETE_WINDOW", self.close)
+        for setting in (self.folder, self.host, self.port, self.key):
+            setting.trace_add("write", self.schedule_save)
         root.after(100, self.refresh)
+
+    def schedule_save(self, *_):
+        if self.save_timer is not None:
+            self.root.after_cancel(self.save_timer)
+        self.save_timer = self.root.after(500, self.save)
+
+    def save(self):
+        self.save_timer = None
+        try:
+            save_settings({name: getattr(self, name).get() for name in ("folder", "host", "port", "key")})
+        except OSError:
+            self.status.set("Не удалось сохранить настройки Windows.")
 
     def paste(self, entry):
         try:
@@ -199,6 +216,9 @@ class Launcher:
     def close(self):
         if self.installing:
             return
+        if self.save_timer is not None:
+            self.root.after_cancel(self.save_timer)
+            self.save()
         self.stop.set()
         self.root.destroy()
 
