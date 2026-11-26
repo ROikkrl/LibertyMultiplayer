@@ -16,11 +16,47 @@ const PACKET_LIMIT: usize = 1200;
 const SIGNATURE_LEN: usize = 32;
 const PLAYER_TIMEOUT: Duration = Duration::from_secs(3);
 
+type Position = [f64; 3];
+type Sector = (i32, i32);
+
 struct Player {
     state: String,
     seen: Instant,
     modern: bool,
     shares_world: bool,
+    position: Position,
+    sample: u64,
+    driving: bool,
+    vehicle_token: i32,
+    seated: bool,
+    combat: Option<CombatInput>,
+    result: CombatResult,
+}
+
+#[derive(Clone, Copy)]
+struct CombatInput {
+    enabled: bool,
+    ragdoll: bool,
+    dead: bool,
+    sequence: u64,
+    kind: u8,
+}
+
+#[derive(Default)]
+struct CombatResult {
+    acknowledged: u64,
+    damage: u32,
+    hit_kind: u8,
+    hit_until: Option<Instant>,
+    last_attack: Option<Instant>,
+    last_ram: Option<Instant>,
+}
+
+struct Update<'a> {
+    id: &'a str,
+    challenge: &'a str,
+    player: Player,
+    target: &'a str,
 }
 
 fn valid_id(value: &str) -> bool {
@@ -44,7 +80,11 @@ fn authenticate<'a>(packet: &'a [u8], signer: &PacketMac) -> Option<&'a str> {
     std::str::from_utf8(payload).ok()
 }
 
-fn parse_update(payload: &str) -> Option<(&str, &str, String, bool, bool)> {
+fn parse_update(payload: &str, now: Instant) -> Option<Update<'_>> {
+    let (payload, combat_data) = match payload.rsplit_once(" !") {
+        Some((state, data)) => (state, Some(data)),
+        None => (payload, None),
+    };
     let (payload, metadata) = match payload.rsplit_once(" ~") {
         Some((state, meta)) => (state, Some(meta)),
         None => (payload, None),
@@ -65,6 +105,9 @@ fn parse_update(payload: &str) -> Option<(&str, &str, String, bool, bool)> {
     ];
     let [x, y, z] = position;
     let mut state = format!("{x:.2} {y:.2} {z:.2}");
+    let mut driving = false;
+    let mut vehicle_token = 0;
+    let mut seated = false;
     if let Some(raw_heading) = fields.next() {
         let heading: f64 = raw_heading.parse().ok()?;
         let ped: i32 = fields.next()?.parse().ok()?;
@@ -78,6 +121,9 @@ fn parse_update(payload: &str) -> Option<(&str, &str, String, bool, bool)> {
             (car != 0 && (handle == 0 || ride != "-")) {
             return None;
         }
+        driving = car != 0;
+        vehicle_token = handle;
+        seated = driving || ride != "-";
         write!(&mut state, " {heading:.2} {ped} {car} {handle} {ride}").ok()?;
         if let Some(world) = fields.next() {
             if world.len() > 250 {
@@ -137,15 +183,19 @@ fn parse_update(payload: &str) -> Option<(&str, &str, String, bool, bool)> {
         }
     }
     let mut shares_world = false;
+    let mut sample = 0;
     if let Some(meta) = metadata {
         if state.split_ascii_whitespace().count() < 9 {
             return None;
         }
         let mut parts = meta.split(',');
-        for _ in 0..2 {
+        for index in 0..2 {
             let value = parts.next()?;
             if value.is_empty() || value.len() > 12 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
                 return None;
+            }
+            if index == 0 {
+                sample = value.parse().ok()?;
             }
         }
         shares_world = match parts.next()? {
@@ -165,10 +215,118 @@ fn parse_update(payload: &str) -> Option<(&str, &str, String, bool, bool)> {
         }
         write!(&mut state, " ~{meta}").ok()?;
     }
-    if fields.next().is_some() || state.len() > 360 {
+    if fields.next().is_some() || state.len() > 332 {
         return None;
     }
-    Some((player, challenge, state, metadata.is_some(), shares_world))
+    let mut target = "-";
+    let combat = if let Some(data) = combat_data {
+        metadata?;
+        let mut parts = data.split(',');
+        let flags: u8 = parts.next()?.parse().ok()?;
+        let sequence: u64 = parts.next()?.parse().ok()?;
+        let kind: u8 = parts.next()?.parse().ok()?;
+        target = parts.next()?;
+        if flags > 7 || kind > 2 || parts.next().is_some() ||
+            (kind == 0 && target != "-") || (kind != 0 && (!valid_id(target) || sequence == 0)) {
+            return None;
+        }
+        Some(CombatInput { enabled: flags & 1 != 0, ragdoll: flags & 2 != 0,
+            dead: flags & 4 != 0, sequence, kind })
+    } else {
+        None
+    };
+    Some(Update { id: player, challenge, target, player: Player {
+        state, seen: now, modern: metadata.is_some(), shares_world, position, sample,
+        driving, vehicle_token, seated, combat, result: CombatResult::default(),
+    } })
+}
+
+fn sector(position: Position) -> Sector {
+    ((position[0] / 160.0).floor() as i32, (position[1] / 160.0).floor() as i32)
+}
+
+fn distance_squared(a: Position, b: Position) -> f64 {
+    (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)
+}
+
+fn ram_speed(previous: (Position, u64), new: &Player, victim: Position) -> Option<f64> {
+    let milliseconds = new.sample.checked_sub(previous.1)?;
+    if !(15..=300).contains(&milliseconds) {
+        return None;
+    }
+    let a = previous.0;
+    let b = new.position;
+    let dx = b[0] - a[0];
+    let dy = b[1] - a[1];
+    let length_squared = dx * dx + dy * dy;
+    let speed = length_squared.sqrt() * 1_000.0 / milliseconds as f64;
+    if !(5.0..=100.0).contains(&speed) {
+        return None;
+    }
+    let t = (((victim[0] - a[0]) * dx + (victim[1] - a[1]) * dy) / length_squared).clamp(0.0, 1.0);
+    let z = a[2] + (b[2] - a[2]) * t;
+    let lateral = (victim[0] - a[0] - dx * t).powi(2) + (victim[1] - a[1] - dy * t).powi(2);
+    (lateral <= 1.55_f64.powi(2) && (z - victim[2]).abs() <= 1.5).then_some(speed)
+}
+
+fn ready(previous: Option<Instant>, now: Instant, millis: u64) -> bool {
+    previous.map_or(true, |time| now.duration_since(time) >= Duration::from_millis(millis))
+}
+
+fn eligible(player: &Player, now: Instant) -> bool {
+    player.combat.map_or(false, |state| state.enabled && !state.dead) &&
+        now.duration_since(player.seen) < Duration::from_millis(800)
+}
+
+fn apply_hit(player: &mut Player, kind: u8, damage: u32, now: Instant) {
+    player.result.damage = player.result.damage.saturating_add(damage);
+    player.result.hit_kind = kind;
+    player.result.hit_until = Some(now + Duration::from_millis(if kind == 3 { 1300 } else { 650 }));
+    if kind == 3 {
+        player.result.last_ram = Some(now);
+    }
+}
+
+fn simulate_hits(players: &mut HashMap<String, Player>, id: &str, target: &str,
+                 previous: Option<(Position, u64)>, now: Instant, log: &mut Option<fs::File>) {
+    let attack = players.get(id).and_then(|player| player.combat);
+    if let Some(input) = attack {
+        let player = &mut players.get_mut(id).expect("sender exists");
+        if input.sequence > player.result.acknowledged {
+            player.result.acknowledged = input.sequence;
+            let interval = if input.kind == 1 { 330 } else { 95 };
+            if input.kind != 0 && !input.ragdoll && eligible(player, now) &&
+                ready(player.result.last_attack, now, interval) && target != id {
+                player.result.last_attack = Some(now);
+                let origin = player.position;
+                let range = if input.kind == 1 { 3.2_f64 } else { 180.0_f64 };
+                if let Some(victim) = players.get_mut(target) {
+                    if eligible(victim, now) && distance_squared(origin, victim.position) <= range.powi(2) {
+                        apply_hit(victim, input.kind, if input.kind == 1 { 12 } else { 24 }, now);
+                        event(log, &format!("pvp_hit kind={} source={id} target={target}", input.kind));
+                    }
+                }
+            }
+        }
+    }
+    if let Some(previous) = previous {
+        let driver = &players[id];
+        if !driver.driving || !eligible(driver, now) {
+            return;
+        }
+        let hits: Vec<_> = players.iter().filter_map(|(peer_id, victim)| {
+            if peer_id == id || victim.seated || !eligible(victim, now) ||
+                !ready(victim.result.last_ram, now, 1600) {
+                return None;
+            }
+            ram_speed(previous, driver, victim.position).map(|speed| (peer_id.clone(), speed))
+        }).collect();
+        for (peer, speed) in hits {
+            apply_hit(players.get_mut(&peer).expect("victim exists"), 3,
+                (speed * 2.0).round().clamp(10.0, 75.0) as u32, now);
+            event(log, &format!("pvp_hit kind=3 source={id} target={peer}"));
+        }
+    }
 }
 
 fn event(log: &mut Option<fs::File>, message: &str) {
@@ -204,7 +362,7 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: Option<fs::File>) -> io:
     let mut incoming = [0u8; 65_536];
     let mut outgoing = [0u8; PACKET_LIMIT];
     let mut snapshot = String::with_capacity(PACKET_LIMIT - SIGNATURE_LEN);
-    let mut world_owner: Option<String> = None;
+    let mut region_owners = HashMap::<Sector, String>::new();
     loop {
         let now = Instant::now();
         players.retain(|id, player| {
@@ -231,15 +389,22 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: Option<fs::File>) -> io:
             }
             continue;
         }
-        let (id, challenge, state, modern, shares_world) = match parse_update(payload) {
+        let now = Instant::now();
+        let Update { id, challenge, target, player: update } = match parse_update(payload, now) {
             Some(update) => update,
             None => continue,
         };
 
-        let now = Instant::now();
-        let update = Player { state, seen: now, modern, shares_world };
+        let modern = update.modern;
+        let modern_combat = update.combat.is_some();
+        let region = sector(update.position);
+        let mut previous = None;
         if let Some(player) = players.get_mut(id) {
-            *player = update;
+            if player.driving && update.driving && player.vehicle_token == update.vehicle_token {
+                previous = Some((player.position, player.sample));
+            }
+            let result = std::mem::take(&mut player.result);
+            *player = Player { result, ..update };
         } else if players.len() < MAX_PLAYERS {
             players.insert(id.to_owned(), update);
             event(&mut log, &format!("connect player={id} online={}/{}", players.len(), MAX_PLAYERS));
@@ -247,19 +412,22 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: Option<fs::File>) -> io:
             continue;
         }
 
-        if !world_owner.as_deref().and_then(|owner| players.get(owner))
-            .map_or(false, |owner| owner.shares_world) {
-            let next = players.iter().filter(|(_, peer)| peer.shares_world)
-                .map(|(id, _)| id).min().cloned();
-            if world_owner != next {
-                event(&mut log, &format!("world_owner={}", next.as_deref().unwrap_or("-")));
-                world_owner = next;
+        simulate_hits(&mut players, id, target, previous, now, &mut log);
+        region_owners.retain(|region, owner| players.get(owner)
+            .map_or(false, |peer| peer.shares_world && sector(peer.position) == *region));
+        for (peer_id, peer) in &players {
+            if peer.shares_world {
+                region_owners.entry(sector(peer.position)).or_insert_with(|| peer_id.clone());
             }
         }
+        let owner = region_owners.get(&region).map_or("-", String::as_str);
         snapshot.clear();
-        if modern {
-            writeln!(&mut snapshot, "{challenge} {}", world_owner.as_deref().unwrap_or("-"))
-                .expect("writing to String");
+        if modern_combat {
+            let local = &players[id].result;
+            writeln!(&mut snapshot, "{challenge} {owner} {} {} {}", local.acknowledged,
+                local.damage, local.hit_kind).expect("writing to String");
+        } else if modern {
+            writeln!(&mut snapshot, "{challenge} {owner}").expect("writing to String");
         } else {
             writeln!(&mut snapshot, "{challenge}").expect("writing to String");
         }
@@ -272,7 +440,26 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: Option<fs::File>) -> io:
             } else {
                 &peer.state
             };
-            writeln!(&mut snapshot, "{peer_id} {state}").expect("writing to String");
+            write!(&mut snapshot, "{peer_id} ").expect("writing to String");
+            if peer_id == owner {
+                snapshot.push_str(state);
+            } else {
+                for (index, field) in state.split_ascii_whitespace().enumerate() {
+                    if index != 0 {
+                        snapshot.push(' ');
+                    }
+                    snapshot.push_str(if index == 8 { "-" } else { field });
+                }
+            }
+            if modern_combat {
+                if let Some(input) = peer.combat {
+                    let ragdoll = input.ragdoll || peer.result.hit_until.map_or(false, |time| time > now);
+                    let flags = u8::from(input.enabled) | (u8::from(ragdoll) << 1) |
+                        (u8::from(input.dead) << 2);
+                    write!(&mut snapshot, " !{flags}").expect("writing to String");
+                }
+            }
+            snapshot.push('\n');
         }
         reply(&socket, &signer, snapshot.as_bytes(), sender, &mut outgoing, &mut log);
     }

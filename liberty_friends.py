@@ -14,9 +14,18 @@ PLAYER_ID = re.compile(rb"[0-9a-f]{16}")
 RIDE_ID = re.compile(rb"(?:-|[0-9a-f]{16}:-?[0-9]{1,10})")
 WORLD_ENTITY = re.compile(rb"(?:p(?:,-?[0-9]{1,11}){6}|v(?:,-?[0-9]{1,11}){6}(?:,-?[0-9]{1,4}){0,4})")
 STATE_META = re.compile(rb"~([0-9]{1,12}),([0-9]{1,12}),([01]),([0-3]),(-1|[0-9]{1,3}),(-|[A-Za-z0-9_]{1,32})")
+COMBAT_META = re.compile(rb"!([0-7]),([0-9]{1,19}),([0-2]),(-|[0-9a-f]{16})")
 
 
 def coordinates(fields):
+    combat = None
+    if fields and fields[-1].startswith(b"!"):
+        combat = fields[-1]
+        match = COMBAT_META.fullmatch(combat)
+        if (not match or (match[3] == b"0") != (match[4] == b"-") or
+                (match[3] != b"0" and int(match[2]) == 0)):
+            raise ValueError("invalid combat state")
+        fields = fields[:-1]
     metadata = b""
     metadata_field = None
     if fields and fields[-1].startswith(b"~"):
@@ -28,6 +37,8 @@ def coordinates(fields):
         fields = fields[:-1]
         if len(fields) < 9:
             raise ValueError("metadata requires entity state")
+    if combat is not None and not metadata:
+        raise ValueError("combat requires entity metadata")
     if len(fields) not in (3, 8, 9, 10, 11):
         raise ValueError("expected three coordinates")
     values = tuple(map(float, fields[:3]))
@@ -67,15 +78,17 @@ def coordinates(fields):
         if not -1 <= station <= 19:
             raise ValueError("invalid radio station")
         state += f" {station}".encode("ascii")
-    if len(state) + len(metadata) > 360:
+    if len(state) + len(metadata) > 332:
         if len(fields) >= 9 and fields[8] != b"-":
             fields = list(fields)
             fields[8] = fields[8].rpartition(b";")[0] or b"-"
             if metadata_field is not None:
                 fields.append(metadata_field)
+            if combat is not None:
+                fields.append(combat)
             return coordinates(fields)
         raise ValueError("entity state is too large")
-    return state + metadata
+    return state + metadata + (b" " + combat if combat is not None else b"")
 
 
 def seal(key, payload):
@@ -130,7 +143,7 @@ def serve(args):
                     continue
                 if not PLAYER_ID.fullmatch(challenge):
                     continue
-                position = coordinates(fields)
+                position = coordinates(fields).split(b" !", 1)[0]
             except ValueError:
                 continue
             now = time.monotonic()
@@ -187,12 +200,19 @@ def join(args, stop=None, report=print):
                     sock.settimeout(max(0.001, deadline - time.monotonic()))
                     response = open_packet(args.key, sock.recv(65535))
                     header, _, rows = response.partition(b"\n")
-                    received, _, owner = header.partition(b" ")
-                    if received != challenge or (owner and owner != b"-" and not PLAYER_ID.fullmatch(owner)):
+                    fields = header.split()
+                    if not fields or fields[0] != challenge or len(fields) not in (1, 2, 5):
+                        continue
+                    if len(fields) >= 2 and fields[1] != b"-" and not PLAYER_ID.fullmatch(fields[1]):
+                        continue
+                    if len(fields) == 5 and (
+                        not fields[2].isdigit() or not fields[3].isdigit() or
+                        fields[4] not in (b"0", b"1", b"2", b"3")
+                    ):
                         continue
                     bridge_header = str(time.monotonic_ns()).encode()
-                    if owner:
-                        bridge_header += b" " + owner
+                    if len(fields) > 1:
+                        bridge_header += b" " + b" ".join(fields[1:])
                     temporary_file.write_bytes(bridge_header + b"\n" + rows)
                     temporary_file.replace(peer_file)
                     next_status = f"Connected — other players: {len(rows.splitlines())}"

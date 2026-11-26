@@ -22,6 +22,7 @@ public sealed class LibertyFriends : Script
         public string StationName = "-";
         public int VehicleFlags = -1;
         public long Sample = -1, WorldSample = -1;
+        public int CombatFlags;
     }
 
     private sealed class CarPhysics
@@ -103,6 +104,7 @@ public sealed class LibertyFriends : Script
     private bool active;
     private bool experimentalEntities;
     private bool experimentalWorld;
+    private bool combatEnabled;
     private bool reportedPeers;
     private string lastSnapshot;
     private long lastUpdate;
@@ -137,6 +139,13 @@ public sealed class LibertyFriends : Script
     private string sourceStationName = "-";
     private int sourceStation = -1;
     private long nextRadioSample;
+    private long pendingAttack, pendingAttackUntil;
+    private int pendingAttackKind;
+    private string pendingVictim = "-";
+    private uint receivedDamage;
+    private bool combatHeaderSeen;
+    private readonly HashSet<string> vulnerableAvatars = new HashSet<string>();
+    private readonly Dictionary<string, long> avatarRagdollUntil = new Dictionary<string, long>();
 
     public LibertyFriends()
     {
@@ -156,6 +165,7 @@ public sealed class LibertyFriends : Script
             if (!experimentalEntities)
             {
                 experimentalWorld = false;
+                combatEnabled = false;
                 ClearMarkers();
             }
             lastSnapshot = null;
@@ -176,6 +186,16 @@ public sealed class LibertyFriends : Script
             ToggleRide();
             return;
         }
+        if (active && experimentalEntities && e.Key == Keys.F7)
+        {
+            combatEnabled = !combatEnabled;
+            if (!combatEnabled) ClearPendingAttack();
+            foreach (Vehicle car in cars.Values)
+                if (Exists(car)) GTA.Native.Function.Call("SET_CAR_COLLISION", car, !combatEnabled);
+            Trace(combatEnabled ? "pvp enabled" : "pvp disabled");
+            Game.DisplayText(combatEnabled ? "Liberty Friends: PvP ON" : "Liberty Friends: PvP OFF");
+            return;
+        }
         if (e.Key != Keys.F9) return;
         if (!active && (!Directory.Exists(directory) || !Player.CanControlCharacter)) return;
         active = !active;
@@ -184,6 +204,8 @@ public sealed class LibertyFriends : Script
             ClearMarkers();
             experimentalEntities = false;
             experimentalWorld = false;
+            combatEnabled = false;
+            ClearPendingAttack();
             reportedPeers = false;
         }
         Trace(active ? "session enabled (map only)" : "session disabled");
@@ -222,7 +244,16 @@ public sealed class LibertyFriends : Script
                 if (ride != "-" && (!cars.TryGetValue(ride, out passengerCar) ||
                     !Exists(passengerCar) || !Equals(car, passengerCar))) ride = "-";
                 string identity = Path.Combine(directory, "player.txt");
-                if (File.Exists(identity)) ownId = File.ReadAllText(identity).Trim();
+                if (File.Exists(identity))
+                {
+                    string id = File.ReadAllText(identity).Trim();
+                    if (id != ownId)
+                    {
+                        ownId = id;
+                        combatHeaderSeen = false;
+                        ClearPendingAttack();
+                    }
+                }
                 if (now >= nextWorldSample)
                 {
                     nextWorldSample = now + 67;
@@ -237,15 +268,18 @@ public sealed class LibertyFriends : Script
                     nextRadioSample = now + 150;
                 }
                 int flags = driving ? ((car.EngineRunning ? 1 : 0) | (car.SirenActive ? 2 : 0)) : 0;
+                CaptureCombat(character, now);
+                int combatFlags = (combatEnabled && experimentalEntities ? 1 : 0) |
+                    (experimentalEntities && character.isRagdoll ? 2 : 0) | (!character.isAlive ? 4 : 0);
                 string position = string.Format(CultureInfo.InvariantCulture,
-                    "{0} {1:F2} {2:F2} {3:F2} {4:F2} {5} {6} {7} {8} {9}{10} ~{0},{11},{12},{13},{14},{15}\n",
+                    "{0} {1:F2} {2:F2} {3:F2} {4:F2} {5} {6} {7} {8} {9}{10} ~{0},{11},{12},{13},{14},{15} !{16},{17},{18},{19}\n",
                     now, p.X, p.Y, p.Z,
                     ((driving ? car.Heading : character.Heading) % 360 + 360) % 360,
                     character.Model.Hash, driving ? car.Model.Hash : 0, driving ? drivingToken : 0, ride, worldSample,
                     driving ? CaptureCarPhysics(car) + " " +
                         (sourceStation <= (int)RadioStation.Integrity ? sourceStation : -1).ToString(CultureInfo.InvariantCulture) : "",
                     worldSampleAt, experimentalWorld ? 1 : 0, flags, driving ? sourceStation : -1,
-                    driving ? sourceStationName : "-");
+                    driving ? sourceStationName : "-", combatFlags, pendingAttack, pendingAttackKind, pendingVictim);
                 File.WriteAllText(Path.Combine(directory, "position.txt"), position);
             }
 
@@ -275,7 +309,8 @@ public sealed class LibertyFriends : Script
         var seen = new HashSet<string>();
         string[] lines = snapshot.Split('\n');
         string[] header = lines[0].Split(' ');
-        string newOwner = header.Length == 2 ? header[1] : null;
+        string newOwner = header.Length >= 2 ? header[1] : null;
+        ApplyCombatResult(header, character);
         if (newOwner != worldOwner)
         {
             worldOwner = newOwner;
@@ -285,6 +320,14 @@ public sealed class LibertyFriends : Script
         for (int i = 1; i < lines.Length; i++)
         {
             string[] columns = lines[i].Split(' ');
+            int combatFlags = 0;
+            string combat = columns[columns.Length - 1];
+            if (combat.StartsWith("!", StringComparison.Ordinal))
+            {
+                int.TryParse(combat.Substring(1), out combatFlags);
+                Array.Resize(ref columns, columns.Length - 1);
+            }
+            if (columns.Length == 0) continue;
             string metadata = columns[columns.Length - 1];
             if (metadata.StartsWith("~", StringComparison.Ordinal))
                 Array.Resize(ref columns, columns.Length - 1);
@@ -295,7 +338,7 @@ public sealed class LibertyFriends : Script
                 !TryCoordinate(columns[3], out z)) continue;
             seen.Add(columns[0]);
             var position = new Vector3(x, y, z);
-            var peer = new Peer { Position = position };
+            var peer = new Peer { Position = position, CombatFlags = combatFlags };
             if (columns.Length >= 9 &&
                 TryCoordinate(columns[4], out peer.Heading) &&
                 int.TryParse(columns[5], out peer.PedModel) &&
@@ -318,6 +361,7 @@ public sealed class LibertyFriends : Script
             if (experimentalEntities)
             {
                 UpdateAvatar(columns[0], position, character, peer.PedModel);
+                PrepareCombatAvatar(columns[0], peer);
                 UpdateAvatarMotion(columns[0], peer);
             }
             Blip marker;
@@ -348,6 +392,8 @@ public sealed class LibertyFriends : Script
                 if (Exists(avatars[id])) avatars[id].Delete();
                 avatars.Remove(id);
                 avatarGaits.Remove(id);
+                vulnerableAvatars.Remove(id);
+                avatarRagdollUntil.Remove(id);
             }
         }
         if (!reportedPeers && seen.Count > 0)
@@ -361,6 +407,88 @@ public sealed class LibertyFriends : Script
             TunePassengerRadio(character);
             if (experimentalWorld) UpdateWorld(character);
         }
+    }
+
+    private void ClearPendingAttack()
+    {
+        pendingAttack = 0;
+        pendingAttackKind = 0;
+        pendingVictim = "-";
+    }
+
+    private void CaptureCombat(Ped character, long now)
+    {
+        if (!combatEnabled || !experimentalEntities || !character.isAlive || character.isRagdoll)
+        {
+            ClearPendingAttack();
+            return;
+        }
+        if (pendingAttack != 0 && now < pendingAttackUntil) return;
+        ClearPendingAttack();
+
+        int weapon = (int)character.Weapons.CurrentType;
+        int kind = weapon >= 0 && weapon <= 3 ? 1
+            : weapon >= 7 && weapon <= 17 && weapon != 8 ? 2 : 0;
+        if (kind == 0) return;
+        foreach (var pair in avatars)
+        {
+            Peer peer;
+            Ped avatar = pair.Value;
+            if (!vulnerableAvatars.Contains(pair.Key) || !Exists(avatar) ||
+                !peers.TryGetValue(pair.Key, out peer) || (peer.CombatFlags & 5) != 1 ||
+                !avatar.HasBeenDamagedBy(character)) continue;
+
+            // GTA decides whether the local attack made contact, including walls and props.
+            GTA.Native.Function.Call("CLEAR_CHAR_LAST_DAMAGE_ENTITY", avatar);
+            avatar.Health = 1000;
+            pendingAttack = DateTime.UtcNow.Ticks;
+            pendingAttackUntil = now + 600;
+            pendingAttackKind = kind;
+            pendingVictim = pair.Key;
+            return;
+        }
+    }
+
+    private void PrepareCombatAvatar(string id, Peer peer)
+    {
+        Ped avatar;
+        if (!avatars.TryGetValue(id, out avatar) || !Exists(avatar)) return;
+        bool vulnerable = combatEnabled && (peer.CombatFlags & 5) == 1;
+        if (vulnerable && vulnerableAvatars.Add(id))
+        {
+            avatar.MaxHealth = 1000;
+            avatar.Health = 1000;
+            GTA.Native.Function.Call("CLEAR_CHAR_LAST_DAMAGE_ENTITY", avatar);
+            avatar.Invincible = false;
+        }
+        else if (!vulnerable && vulnerableAvatars.Remove(id))
+        {
+            avatar.Invincible = true;
+        }
+        if (vulnerable && avatar.isAlive && avatar.Health < 750) avatar.Health = 1000;
+    }
+
+    private void ApplyCombatResult(string[] header, Ped character)
+    {
+        long acknowledged;
+        uint total;
+        int kind;
+        if (header.Length != 5 || !long.TryParse(header[2], out acknowledged) ||
+            !uint.TryParse(header[3], out total) || !int.TryParse(header[4], out kind)) return;
+        if (pendingAttack != 0 && acknowledged >= pendingAttack) ClearPendingAttack();
+        uint old = receivedDamage;
+        receivedDamage = total;
+        if (!combatHeaderSeen || total < old)
+        {
+            combatHeaderSeen = true;
+            return;
+        }
+        if (!combatEnabled || total == old || !Exists(character) || !character.isAlive) return;
+        int damage = (int)Math.Min(500u, total - old);
+        GTA.Native.Function.Call("DAMAGE_CHAR", character, damage, true);
+        if (character.isAlive && !character.isInVehicle() && !character.isRagdoll)
+            character.ForceRagdoll(kind == 3 ? 1300 : 650, false);
+        Trace("pvp damage=" + damage + " kind=" + kind);
     }
 
     private static void ReadMetadata(Peer peer, string metadata)
@@ -566,9 +694,15 @@ public sealed class LibertyFriends : Script
             if (Exists(avatar)) avatar.Delete();
             avatars.Remove(id);
             avatarGaits.Remove(id);
+            vulnerableAvatars.Remove(id);
+            avatarRagdollUntil.Remove(id);
             return;
         }
-        if (Exists(avatar) || clock.ElapsedMilliseconds < nextAvatarSpawn) return;
+        if ((Exists(avatar) && avatar.isAlive) || clock.ElapsedMilliseconds < nextAvatarSpawn) return;
+        if (Exists(avatar)) avatar.Delete();
+        vulnerableAvatars.Remove(id);
+        avatarRagdollUntil.Remove(id);
+        avatarGaits.Remove(id);
         nextAvatarSpawn = clock.ElapsedMilliseconds + 500;
         // The player model is special and the scripted CreateChar path crashed on CE.
         Trace("creating remote player with ambient native; advertised model=" + modelHash);
@@ -629,12 +763,32 @@ public sealed class LibertyFriends : Script
                 avatar.LeaveVehicle();
                 continue;
             }
+            if ((peer.CombatFlags & 6) != 0)
+            {
+                UpdateRemoteRagdoll(entry.Key, avatar, peer, now);
+                continue;
+            }
+            avatarRagdollUntil.Remove(entry.Key);
             avatar.FreezePosition = true;
             Vector3 current = avatar.Position;
             if (SquaredDistance(current, peer.Position) > 0.0001f)
                 SetPedPosition(avatar, Blend(current, peer.Position, step));
             avatar.Heading = peer.Heading;
         }
+    }
+
+    private void UpdateRemoteRagdoll(string id, Ped avatar, Peer peer, long now)
+    {
+        long next;
+        if (!avatarRagdollUntil.TryGetValue(id, out next) || now >= next)
+        {
+            avatar.FreezePosition = false;
+            if (!avatar.isRagdoll) avatar.ForceRagdoll(950, false);
+            avatarRagdollUntil[id] = now + 750;
+        }
+        Vector3 current = avatar.Position;
+        if (SquaredDistance(current, peer.Position) > 1.0f)
+            SetPedPosition(avatar, peer.Position);
     }
 
     private static float BlendHeading(float from, float to, float step)
@@ -647,7 +801,7 @@ public sealed class LibertyFriends : Script
     {
         Ped avatar;
         if (!avatars.TryGetValue(id, out avatar) || !Exists(avatar) ||
-            peer.CarId != null || peer.Ride != "-" || Exists(avatar.CurrentVehicle))
+            (peer.CombatFlags & 6) != 0 || peer.CarId != null || peer.Ride != "-" || Exists(avatar.CurrentVehicle))
         {
             avatarGaits.Remove(id);
             return;
@@ -762,6 +916,7 @@ public sealed class LibertyFriends : Script
                 if (peer.Physics != null) car.RotationQuaternion = peer.Physics.Orientation;
                 else car.Heading = peer.Heading;
                 car.FreezePosition = true;
+                if (combatEnabled) GTA.Native.Function.Call("SET_CAR_COLLISION", car, false);
                 cars[peer.CarId] = car;
                 appliedDamage.Remove(peer.CarId);
                 appliedVehicleFlags.Remove(peer.CarId);
@@ -990,6 +1145,8 @@ public sealed class LibertyFriends : Script
             if (Exists(avatar)) avatar.Delete();
         avatars.Clear();
         avatarGaits.Clear();
+        vulnerableAvatars.Clear();
+        avatarRagdollUntil.Clear();
         foreach (string id in new List<string>(cars.Keys)) RemoveCar(id);
         peers.Clear();
         UpdateWorld(null);
