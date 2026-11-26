@@ -95,9 +95,27 @@ fn parse_update(payload: &str) -> Option<(&str, &str, String)> {
                 }
             }
             write!(&mut state, " {world}").ok()?;
+            if let Some(physics) = fields.next() {
+                if car == 0 || physics.len() > 80 {
+                    return None;
+                }
+                let mut parts = physics.split(',');
+                let mut values = [0.0_f64; 7];
+                for value in &mut values {
+                    *value = parts.next()?.parse().ok()?;
+                }
+                let length_squared: f64 = values[..4].iter().map(|value| value * value).sum();
+                if parts.next().is_some() || !(0.5..=1.5).contains(&length_squared) ||
+                    !(-4000.0..=1000.0).contains(&values[4]) ||
+                    !(0.0..=1000.0).contains(&values[5]) ||
+                    !(-4000.0..=1000.0).contains(&values[6]) {
+                    return None;
+                }
+                write!(&mut state, " {physics}").ok()?;
+            }
         }
     }
-    if fields.next().is_some() {
+    if fields.next().is_some() || state.len() > 360 {
         return None;
     }
     Some((player, challenge, state))

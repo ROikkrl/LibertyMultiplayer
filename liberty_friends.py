@@ -16,7 +16,7 @@ WORLD_ENTITY = re.compile(rb"[pv](?:,-?[0-9]{1,11}){6}")
 
 
 def coordinates(fields):
-    if len(fields) not in (3, 8, 9):
+    if len(fields) not in (3, 8, 9, 10):
         raise ValueError("expected three coordinates")
     values = tuple(map(float, fields[:3]))
     if not all(-20000 <= value <= 20000 for value in values):
@@ -32,13 +32,24 @@ def coordinates(fields):
     if not RIDE_ID.fullmatch(ride) or (car != 0 and (handle == 0 or ride != b"-")):
         raise ValueError("invalid vehicle state")
     state = f"{position} {heading:.2f} {ped} {car} {handle} {ride.decode('ascii')}".encode("ascii")
-    if len(fields) == 9:
+    if len(fields) >= 9:
         world = fields[8]
         entities = world.split(b";")
         if len(world) > 250 or (world != b"-" and
                 (len(entities) > 4 or not all(WORLD_ENTITY.fullmatch(item) for item in entities))):
             raise ValueError("invalid world state")
         state += b" " + world
+    if len(fields) == 10:
+        physics = fields[9]
+        values = [float(value) for value in physics.split(b",")]
+        if (car == 0 or len(physics) > 80 or len(values) != 7 or
+                not 0.5 <= sum(value * value for value in values[:4]) <= 1.5 or
+                not -4000 <= values[4] <= 1000 or
+                not 0 <= values[5] <= 1000 or not -4000 <= values[6] <= 1000):
+            raise ValueError("invalid vehicle physics")
+        state += b" " + physics
+    if len(state) > 360:
+        raise ValueError("entity state is too large")
     return state
 
 

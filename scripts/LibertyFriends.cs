@@ -17,12 +17,21 @@ public sealed class LibertyFriends : Script
         public string Ride = "-";
         public string CarId;
         public string World = "-";
+        public CarPhysics Physics;
+    }
+
+    private sealed class CarPhysics
+    {
+        public Quaternion Orientation;
+        public float EngineHealth, TankHealth;
+        public int BodyHealth;
     }
 
     private readonly Dictionary<string, Blip> markers = new Dictionary<string, Blip>();
     private readonly Dictionary<string, Vector3> positions = new Dictionary<string, Vector3>();
     private readonly Dictionary<string, Ped> avatars = new Dictionary<string, Ped>();
     private readonly Dictionary<string, Vehicle> cars = new Dictionary<string, Vehicle>();
+    private readonly Dictionary<string, CarPhysics> appliedDamage = new Dictionary<string, CarPhysics>();
     private readonly Dictionary<string, Peer> peers = new Dictionary<string, Peer>();
     private readonly Stopwatch clock = Stopwatch.StartNew();
     private readonly string directory;
@@ -135,9 +144,10 @@ public sealed class LibertyFriends : Script
                     worldSample = publishWorld ? CaptureWorld(character, car) : "-";
                 }
                 string position = string.Format(CultureInfo.InvariantCulture,
-                    "{0} {1:F2} {2:F2} {3:F2} {4:F2} {5} {6} {7} {8} {9}\n", now, p.X, p.Y, p.Z,
+                    "{0} {1:F2} {2:F2} {3:F2} {4:F2} {5} {6} {7} {8} {9}{10}\n", now, p.X, p.Y, p.Z,
                     ((driving ? car.Heading : character.Heading) % 360 + 360) % 360,
-                    character.Model.Hash, driving ? car.Model.Hash : 0, driving ? drivingToken : 0, ride, worldSample);
+                    character.Model.Hash, driving ? car.Model.Hash : 0, driving ? drivingToken : 0, ride, worldSample,
+                    driving ? CaptureCarPhysics(car) : "");
                 File.WriteAllText(Path.Combine(directory, "position.txt"), position);
             }
 
@@ -170,7 +180,7 @@ public sealed class LibertyFriends : Script
         {
             string[] columns = lines[i].Split(' ');
             float x, y, z;
-            if ((columns.Length != 4 && columns.Length != 9 && columns.Length != 10) ||
+            if ((columns.Length != 4 && (columns.Length < 9 || columns.Length > 11)) ||
                 !TryCoordinate(columns[1], out x) ||
                 !TryCoordinate(columns[2], out y) ||
                 !TryCoordinate(columns[3], out z)) continue;
@@ -184,9 +194,12 @@ public sealed class LibertyFriends : Script
                 int.TryParse(columns[7], out peer.CarHandle))
             {
                 peer.Ride = columns[8];
-                if (columns.Length == 10) peer.World = columns[9];
+                if (columns.Length >= 10) peer.World = columns[9];
                 if (peer.CarModel != 0)
+                {
                     peer.CarId = columns[0] + ":" + peer.CarHandle.ToString(CultureInfo.InvariantCulture);
+                    if (columns.Length == 11) peer.Physics = ParseCarPhysics(columns[10]);
+                }
             }
             peers[columns[0]] = peer;
             if (experimentalEntities) UpdateAvatar(columns[0], position, character, peer.PedModel);
@@ -317,7 +330,7 @@ public sealed class LibertyFriends : Script
                         ped.FreezePosition = true;
                         worldPeds[key] = ped;
                     }
-                    ped.Position = position;
+                    SetPedPosition(ped, position);
                     ped.Heading = heading;
                 }
                 else if (fields[0] == "v" && entityModel.isVehicle)
@@ -387,8 +400,15 @@ public sealed class LibertyFriends : Script
             Vehicle car;
             if (peer.CarId == null || !cars.TryGetValue(peer.CarId, out car) || !Exists(car)) continue;
             car.Position = Blend(car.Position, peer.Position, step);
-            var delta = (peer.Heading - car.Heading + 540f) % 360f - 180f;
-            car.Heading = (car.Heading + delta * step + 360f) % 360f;
+            if (peer.Physics != null)
+            {
+                car.RotationQuaternion = BlendOrientation(car.RotationQuaternion, peer.Physics.Orientation, step);
+            }
+            else
+            {
+                var delta = (peer.Heading - car.Heading + 540f) % 360f - 180f;
+                car.Heading = (car.Heading + delta * step + 360f) % 360f;
+            }
         }
 
         foreach (var entry in avatars)
@@ -415,7 +435,9 @@ public sealed class LibertyFriends : Script
                 continue;
             }
             avatar.FreezePosition = true;
-            avatar.Position = Blend(avatar.Position, peer.Position, step);
+            Vector3 current = avatar.Position;
+            if (SquaredDistance(current, peer.Position) > 0.0001f)
+                SetPedPosition(avatar, Blend(current, peer.Position, step));
             avatar.Heading = peer.Heading;
         }
     }
@@ -429,15 +451,20 @@ public sealed class LibertyFriends : Script
                 (ride != peer.CarId && SquaredDistance(character.Position, peer.Position) > 10000f)) continue;
             seen.Add(peer.CarId);
             Vehicle car;
-            if (cars.TryGetValue(peer.CarId, out car) && Exists(car)) continue;
-            Model model = new Model(peer.CarModel);
-            if (!model.isVehicle) continue;
-            Trace("creating remote player vehicle " + model.Hash);
-            car = World.CreateVehicle(model, peer.Position);
-            if (!Exists(car)) continue;
-            car.Heading = peer.Heading;
-            car.FreezePosition = true;
-            cars[peer.CarId] = car;
+            if (!cars.TryGetValue(peer.CarId, out car) || !Exists(car))
+            {
+                Model model = new Model(peer.CarModel);
+                if (!model.isVehicle) continue;
+                Trace("creating remote player vehicle " + model.Hash);
+                car = World.CreateVehicle(model, peer.Position);
+                if (!Exists(car)) continue;
+                if (peer.Physics != null) car.RotationQuaternion = peer.Physics.Orientation;
+                else car.Heading = peer.Heading;
+                car.FreezePosition = true;
+                cars[peer.CarId] = car;
+                appliedDamage.Remove(peer.CarId);
+            }
+            if (peer.Physics != null) ApplyDamage(peer.CarId, car, peer.Physics);
         }
         foreach (string id in new List<string>(cars.Keys))
         {
@@ -507,6 +534,59 @@ public sealed class LibertyFriends : Script
         }
         if (Exists(car)) car.Delete();
         cars.Remove(id);
+        appliedDamage.Remove(id);
+    }
+
+    private static void SetPedPosition(Ped ped, Vector3 p)
+    {
+        // The ordinary teleport adjusts Z, so reading its result and blending again can lift the avatar.
+        GTA.Native.Function.Call("SET_CHAR_COORDINATES_NO_OFFSET", ped, p.X, p.Y, p.Z);
+    }
+
+    private static string CaptureCarPhysics(Vehicle car)
+    {
+        Quaternion q = car.RotationQuaternion;
+        return string.Format(CultureInfo.InvariantCulture, " {0:F4},{1:F4},{2:F4},{3:F4},{4:F1},{5},{6:F1}",
+            q.X, q.Y, q.Z, q.W, Math.Max(-4000, Math.Min(1000, car.EngineHealth)),
+            Math.Max(0, Math.Min(1000, car.Health)), Math.Max(-4000, Math.Min(1000, car.PetrolTankHealth)));
+    }
+
+    private static CarPhysics ParseCarPhysics(string encoded)
+    {
+        string[] fields = encoded.Split(',');
+        if (fields.Length != 7) return null;
+        var values = new float[7];
+        for (int i = 0; i < values.Length; i++)
+            if (!TryCoordinate(fields[i], out values[i])) return null;
+        var q = new Quaternion(values[0], values[1], values[2], values[3]);
+        float lengthSquared = q.X * q.X + q.Y * q.Y + q.Z * q.Z + q.W * q.W;
+        if (lengthSquared < 0.5f || lengthSquared > 1.5f ||
+            values[4] < -4000 || values[4] > 1000 || values[5] < 0 || values[5] > 1000 ||
+            values[6] < -4000 || values[6] > 1000) return null;
+        return new CarPhysics { Orientation = Quaternion.Normalize(q),
+            EngineHealth = values[4], BodyHealth = (int)values[5], TankHealth = values[6] };
+    }
+
+    private void ApplyDamage(string id, Vehicle car, CarPhysics state)
+    {
+        CarPhysics previous;
+        appliedDamage.TryGetValue(id, out previous);
+        if (previous == null || previous.BodyHealth != state.BodyHealth)
+            car.Health = state.BodyHealth;
+        if (previous == null || previous.EngineHealth != state.EngineHealth)
+            car.EngineHealth = state.EngineHealth;
+        if (previous == null || previous.TankHealth != state.TankHealth)
+            car.PetrolTankHealth = state.TankHealth;
+        appliedDamage[id] = state;
+    }
+
+    private static Quaternion BlendOrientation(Quaternion from, Quaternion to, float step)
+    {
+        float dot = from.X * to.X + from.Y * to.Y + from.Z * to.Z + from.W * to.W;
+        if (dot < 0) to = new Quaternion(-to.X, -to.Y, -to.Z, -to.W);
+        return Quaternion.Normalize(new Quaternion(
+            from.X + (to.X - from.X) * step, from.Y + (to.Y - from.Y) * step,
+            from.Z + (to.Z - from.Z) * step, from.W + (to.W - from.W) * step));
     }
 
     private static Vector3 Blend(Vector3 current, Vector3 target, float step)
