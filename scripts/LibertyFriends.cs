@@ -283,7 +283,8 @@ public sealed class LibertyFriends : Script
                 }
             }
         }
-        if ((e.Key == Keys.OemOpenBrackets || e.Key == Keys.OemCloseBrackets || e.Key == Keys.OemBackslash) &&
+        if ((e.Key == Keys.OemOpenBrackets || e.Key == Keys.OemCloseBrackets ||
+            e.Key == Keys.OemPipe || e.Key == Keys.OemBackslash) &&
             Exists(drivingCar) && indicatorKey == 0)
         {
             indicatorKey = (int)e.Key;
