@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 
-#include "CEBindings.h"
+#include "CENativeCall.h"
 #include <cmath>
 
 namespace ivmp_ce
@@ -15,55 +15,23 @@ struct LocalPlayer
     float x = 0.0f, y = 0.0f, z = 0.0f;
 };
 
-// Read-only bootstrap calls. Once CPools and the local player are available,
-// the upstream client can begin its normal spawn and session initialization.
-class LocalPlayerReader
+struct OnFootMotion
 {
-    struct ScriptCall
-    {
-        void* result;
-        std::uint32_t count;
-        void* arguments;
-        std::uint32_t vectorCount;
-        void* vectorOutputs[4];
-        alignas(16) float vectors[4][4];
-    };
-    static_assert(offsetof(ScriptCall, vectors) == 0x20, "CE native context vector offset");
-    using Handler = void (__cdecl*)(ScriptCall*);
+    float heading = 0.0f, vx = 0.0f, vy = 0.0f, vz = 0.0f;
+    std::uint32_t health = 0, armour = 0;
+    bool ducking = false;
+};
 
-    Engine engine;
-
-    static std::uint32_t Argument(std::uint32_t value) { return value; }
-
-    template<typename T>
-    static std::uint32_t Argument(T* value) { return reinterpret_cast<std::uint32_t>(value); }
-
-    template<typename... Arguments>
-    bool Invoke(std::uint32_t hash, std::uint32_t& result, Arguments... arguments) const
-    {
-        static_assert(sizeof...(arguments) < 16, "Too many native arguments");
-        auto handler = static_cast<const std::uint8_t*>(engine.NativeHandler(hash));
-        const auto begin = reinterpret_cast<std::uintptr_t>(engine.base);
-        const auto value = reinterpret_cast<std::uintptr_t>(handler);
-        if (value < begin || value - begin >= ImageSize || !PageIsExecutable(handler, 1)) return false;
-        std::uint32_t stack[16] = { Argument(arguments)... };
-        result = 0;
-        ScriptCall call{};
-        call.result = &result;
-        call.count = sizeof...(arguments);
-        call.arguments = stack;
-        reinterpret_cast<Handler>(const_cast<std::uint8_t*>(handler))(&call);
-        return true;
-    }
-
+class LocalPlayerReader : private NativeCall
+{
 public:
-    explicit LocalPlayerReader(Engine resolved) : engine(resolved) {}
+    explicit LocalPlayerReader(Engine resolved) : NativeCall(resolved) {}
 
     bool Read(LocalPlayer& snapshot) const
     {
         LocalPlayer state;
         std::uint32_t result = 0;
-        if (!engine || !Invoke(0x62E319C6, state.id) || state.id >= 32 ||             // GET_PLAYER_ID
+        if (!Invoke(0x62E319C6, state.id) || state.id >= 32 ||                       // GET_PLAYER_ID
             !Invoke(0x08274BA4, result, state.id) || result == 0 ||                  // IS_PLAYER_PLAYING
             !Invoke(0x511454A9, result, state.id, &state.ped) || state.ped == 0 ||    // GET_PLAYER_CHAR
             !Invoke(0x46531797, result, state.ped) || result == 0 ||                 // DOES_CHAR_EXIST
@@ -72,6 +40,23 @@ public:
             !std::isfinite(state.x) || !std::isfinite(state.y) || !std::isfinite(state.z)) return false;
         if (Invoke(0x71184DA3, result, state.ped) && result)                       // IS_CHAR_IN_ANY_CAR
             Invoke(0x1B067237, result, state.ped, &state.vehicle);                  // GET_CAR_CHAR_IS_USING
+        snapshot = state;
+        return true;
+    }
+
+    bool ReadOnFoot(const LocalPlayer& player, OnFootMotion& snapshot) const
+    {
+        if (!player.ped || player.vehicle) return false;
+        OnFootMotion state;
+        std::uint32_t result = 0;
+        if (!Invoke(0x057A3AC7, result, player.ped, &state.heading) ||           // GET_CHAR_HEADING
+            !Invoke(0x3B977FD4, result, player.ped, &state.vx, &state.vy, &state.vz) || // GET_CHAR_VELOCITY
+            !Invoke(0x4B6C2256, result, player.ped, &state.health) ||             // GET_CHAR_HEALTH
+            !Invoke(0x3C756E54, result, player.ped, &state.armour) ||             // GET_CHAR_ARMOUR
+            !Invoke(0x495D6021, result, player.ped) ||                           // IS_CHAR_DUCKING
+            !std::isfinite(state.heading) || !std::isfinite(state.vx) ||
+            !std::isfinite(state.vy) || !std::isfinite(state.vz)) return false;
+        state.ducking = result != 0;
         snapshot = state;
         return true;
     }

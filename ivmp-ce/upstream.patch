@@ -124,10 +124,10 @@ index 207cab5..42a690a 100644
      m_pPedPool = new CIVPool<IVPed>(*(IVPool **)COffsets::VAR_PedPool);
      m_pVehiclePool = new CIVPool<IVVehicle>(*(IVPool **)COffsets::VAR_VehiclePool);
 diff --git a/Client/Core/Client.Core.vcxproj b/Client/Core/Client.Core.vcxproj
-index 775d25e..3d282c1 100644
+index 775d25e..4b0d392 100644
 --- a/Client/Core/Client.Core.vcxproj
 +++ b/Client/Core/Client.Core.vcxproj
-@@ -161,6 +161,10 @@
+@@ -161,6 +161,14 @@
      <ClInclude Include="CGameFileChecker.h" />
      <ClInclude Include="CModelManager.h" />
      <ClInclude Include="COffsets.h" />
@@ -135,6 +135,10 @@ index 775d25e..3d282c1 100644
 +    <ClInclude Include="CompleteEdition\CEBindings.h" />
 +    <ClInclude Include="CompleteEdition\CEFrame.h" />
 +    <ClInclude Include="CompleteEdition\CELocalPlayer.h" />
++    <ClInclude Include="CompleteEdition\CENativeCall.h" />
++    <ClInclude Include="CompleteEdition\CERemoteActors.h" />
++    <ClInclude Include="CompleteEdition\CESession.h" />
++    <ClInclude Include="CompleteEdition\CESessionRuntime.h" />
      <ClInclude Include="CPools.h" />
      <ClInclude Include="Indicators.h" />
      <ClInclude Include="IV\CIVCam.h" />
@@ -238,17 +242,17 @@ index 1170246..e6e0585 100644
  template <typename T>
  struct CSimpleCollection
 diff --git a/Client/Core/Main.cpp b/Client/Core/Main.cpp
-index eca31da..2ee2d0c 100644
+index eca31da..1e78937 100644
 --- a/Client/Core/Main.cpp
 +++ b/Client/Core/Main.cpp
-@@ -10,9 +10,40 @@
+@@ -10,9 +10,41 @@
  #include <windows.h>
  #include <Common.h>
  #include "CClient.h"
 +#include "COffsets.h"
 +#include "CGame.h"
 +#include "CompleteEdition/CEFrame.h"
-+#include "CompleteEdition/CELocalPlayer.h"
++#include "CompleteEdition/CESessionRuntime.h"
  
  CClient * g_pClient = NULL;
  
@@ -256,14 +260,15 @@ index eca31da..2ee2d0c 100644
 +{
 +void OnCompleteEditionFrame(const ivmp_ce::Engine& engine)
 +{
++    const auto now = GetTickCount64();
 +    if (CGame::GetPools())
 +    {
 +        CGame::RefreshCompleteEditionPools();
++        ivmp_ce::SessionRuntime::Instance().Tick(engine, now);
 +        return;
 +    }
 +
 +    static ULONGLONG nextProbe = 0;
-+    const auto now = GetTickCount64();
 +    if (now < nextProbe) return;
 +    nextProbe = now + 100;
 +
@@ -282,7 +287,7 @@ index eca31da..2ee2d0c 100644
  BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
  {
  	switch(fdwReason)
-@@ -22,6 +53,35 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
+@@ -22,6 +54,35 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
  			// Disable thread library notifications
  			DisableThreadLibraryCalls(hModule);
  
@@ -318,7 +323,7 @@ index eca31da..2ee2d0c 100644
  			// Create the client instance
  			g_pClient = new CClient();
  
-@@ -37,7 +97,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
+@@ -37,7 +98,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
  	case DLL_PROCESS_DETACH:
  		{
  			// Call the client OnUnload function
@@ -385,6 +390,41 @@ index 854794d..20f5769 100644
        <FunctionLevelLinking>true</FunctionLevelLinking>
        <IntrinsicFunctions>true</IntrinsicFunctions>
        <PreprocessorDefinitions>WIN_32;WIN32;_CRT_SECURE_NO_WARNINGS;_CRT_SECURE_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+diff --git a/Network/Core/CNetClient.cpp b/Network/Core/CNetClient.cpp
+index 22586b7..b22d22d 100644
+--- a/Network/Core/CNetClient.cpp
++++ b/Network/Core/CNetClient.cpp
+@@ -46,10 +46,14 @@ bool CNetClient::Startup()
+ 
+ void CNetClient::Shutdown(int iBlockDuration)
+ {
+-	if(IsConnected())
+-		Disconnect();
+-
++	if (m_bConnected)
++	{
++		m_bConnected = false;
++		m_pRakPeer->CloseConnection(m_serverAddress, true);
++	}
+ 	m_pRakPeer->Shutdown(iBlockDuration);
++	m_serverAddress = RakNet::UNASSIGNED_SYSTEM_ADDRESS;
++	m_serverSocket = CPlayerSocket();
+ }
+ 
+ eConnectionAttemptResult CNetClient::Connect()
+@@ -67,12 +71,8 @@ void CNetClient::Disconnect()
+ {
+ 	if(IsConnected())
+ 	{
+-		m_bConnected = false;
+-		m_pRakPeer->CloseConnection(m_serverAddress, true);
+ 		Shutdown(500);
+ 		Startup();
+-		m_serverAddress = RakNet::UNASSIGNED_SYSTEM_ADDRESS;
+-		m_serverSocket = CPlayerSocket();
+ 	}
+ }
+ 
 diff --git a/Shared/CEvents.h b/Shared/CEvents.h
 index 6e9026a..61086d7 100644
 --- a/Shared/CEvents.h

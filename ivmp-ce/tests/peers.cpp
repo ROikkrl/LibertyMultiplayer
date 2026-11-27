@@ -2,57 +2,38 @@
 #include <winsock2.h>
 #include <windows.h>
 #include <Network/CNetworkModule.h>
-#include <Network/PacketIdentifiers.h>
+#include "../client/CESession.h"
 #include <cstdio>
 #include <cstdlib>
 #include <initializer_list>
 
 namespace
 {
-bool joined[2]{};
-bool refused = false;
+using ivmp_ce::Session;
+Session sessions[2];
 
-void Handle(unsigned index, CPacket* packet)
-{
-    if (packet->packetId != PACKET_RPC) return;
-    CBitStream reader(packet->ucData, packet->uiLength, false);
-    RPCIdentifier id = 0;
-    if (!reader.Read(id)) return;
-    if (id == RPC_JoinedGame) joined[index] = true;
-    if (id == RPC_ConnectionRefused) refused = true;
-}
+void HandleFirst(CPacket* packet) { if (packet) sessions[0].Handle(*packet); }
+void HandleSecond(CPacket* packet) { if (packet) sessions[1].Handle(*packet); }
 
-void HandleFirst(CPacket* packet) { Handle(0, packet); }
-void HandleSecond(CPacket* packet) { Handle(1, packet); }
-
-bool Connect(CNetClientInterface& peer, unsigned short port, PacketHandler_t handler)
+bool Connect(CNetClientInterface& peer, Session& session, const char* name, unsigned short port, PacketHandler_t handler)
 {
     if (!peer.Startup()) return false;
     peer.SetHost("127.0.0.1");
     peer.SetPort(port);
     peer.SetPacketHandler(handler);
+    session.Begin(peer, name);
     return peer.Connect() == CONNECTION_ATTEMPT_STARTED;
 }
 
-bool Authorize(CNetClientInterface& peer, const char* name)
-{
-    CBitStream connect;
-    connect.Write(NETWORK_VERSION);
-    connect.Write(String(name));
-    CheckGTAFiles files{};
-    connect.Write(reinterpret_cast<const char*>(&files), sizeof(files));
-    return peer.RPC(RPC_PlayerConnect, &connect, PRIORITY_HIGH, RELIABILITY_RELIABLE_ORDERED) != 0;
-}
-
 template<typename Ready>
-bool Wait(CNetClientInterface& first, CNetClientInterface& second, Ready ready)
+bool Wait(Ready ready)
 {
     const auto start = GetTickCount64();
-    while (!refused && GetTickCount64() - start < 5000)
+    while (GetTickCount64() - start < 5000)
     {
-        first.Process();
-        second.Process();
         if (ready()) return true;
+        if (sessions[0].GetState() == Session::State::Failed ||
+            sessions[1].GetState() == Session::State::Failed) return false;
         Sleep(5);
     }
     return false;
@@ -83,23 +64,65 @@ int main(int argc, char** argv)
     auto first = create();
     auto second = create();
     const auto serverPort = static_cast<unsigned short>(port);
-    const bool connected = first && second && Connect(*first, serverPort, HandleFirst) &&
-        Connect(*second, serverPort, HandleSecond) &&
-        Wait(*first, *second, [&] { return first->IsConnected() && second->IsConnected(); });
-    const bool authorized = connected && Authorize(*first, "PortAlpha") && Authorize(*second, "PortBeta") &&
-        Wait(*first, *second, [] { return joined[0] && joined[1]; });
+    const auto pump = [&]
+    {
+        first->Process();
+        second->Process();
+        for (auto& session : sessions) session.CompleteJoin();
+    };
+    const bool authorized = first && second && Connect(*first, sessions[0], "PortAlpha", serverPort, HandleFirst) &&
+        Connect(*second, sessions[1], "PortBeta", serverPort, HandleSecond) &&
+        Wait([&]
+        {
+            pump();
+            return sessions[0].GetState() == Session::State::Joined &&
+                sessions[1].GetState() == Session::State::Joined &&
+                sessions[0].LocalId() != sessions[1].LocalId();
+        });
+    OnFootSyncData frame{};
+    frame.vecPos = CVector3(24.0f, -50.0f, 16.0f);
+    frame.fHeading = 82.0f;
+    frame.vecMoveSpeed = CVector3(1.0f, 2.0f, 0.0f);
+    frame.uHealthArmour = (91u << 16) | 23u;
+    auto reply = frame;
+    reply.vecPos.fY = 75.0f;
+    const bool synced = authorized && Wait([&]
+    {
+        sessions[0].SendOnFoot(frame);
+        sessions[1].SendOnFoot(reply);
+        pump();
+        const auto remote = sessions[1].GetRemote(sessions[0].LocalId());
+        const auto returned = sessions[0].GetRemote(sessions[1].LocalId());
+        return remote && remote->present && remote->hasPosition &&
+            remote->onFoot.vecPos.fY == frame.vecPos.fY &&
+            remote->onFoot.vecMoveSpeed.fX == frame.vecMoveSpeed.fX &&
+            remote->onFoot.fHeading == frame.fHeading &&
+            remote->onFoot.uHealthArmour == frame.uHealthArmour &&
+            returned && returned->present && returned->hasPosition &&
+            returned->onFoot.vecPos.fY == reply.vecPos.fY;
+    });
+    bool removed = false;
+    if (synced)
+    {
+        first->Shutdown(50);
+        removed = Wait([&]
+        {
+            second->Process();
+            return !sessions[1].GetRemote(sessions[0].LocalId())->present;
+        });
+    }
 
     for (auto peer : { first, second })
     {
         if (!peer) continue;
-        if (peer->IsConnected()) peer->Disconnect();
-        peer->Shutdown(100);
+        peer->Shutdown(50);
         destroy(peer);
     }
     FreeLibrary(module);
 
-    if (!connected) std::fputs("Two local IV:MP clients did not complete the transport handshake.\n", stderr);
-    else if (!authorized) std::fputs("Two local IV:MP clients did not receive JoinedGame.\n", stderr);
-    else std::puts("Two local IV:MP clients completed the handshake and received JoinedGame.");
-    return authorized ? 0 : 1;
+    if (!authorized) std::fputs("Two local IV:MP clients did not join.\n", stderr);
+    else if (!synced) std::fputs("A local IV:MP client did not receive the other player's on-foot update.\n", stderr);
+    else if (!removed) std::fputs("A disconnected IV:MP player remained in the remote session.\n", stderr);
+    else std::puts("Two IV:MP clients joined, relayed on-foot motion and removed the disconnected peer.");
+    return removed ? 0 : 1;
 }
