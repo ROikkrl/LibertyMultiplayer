@@ -3,7 +3,6 @@ import hmac
 import os
 import re
 import secrets
-import select
 import socket
 import time
 from pathlib import Path
@@ -13,17 +12,17 @@ MAX_PLAYERS = 4
 TIMEOUT = 3.0
 REPLY_WINDOW = 2.0
 LOSS_NOTICE = 0.8
-INTERVAL = 1 / 30
+INTERVAL = 1 / 60
 PACKET_LIMIT = 1200
 PLAYER_ID = re.compile(rb"[0-9a-f]{16}")
 RIDE_ID = re.compile(rb"(?:-|[0-9a-f]{16}:-?[0-9]{1,10})")
 WORLD_ENTITY = re.compile(rb"(?:p(?:,-?[0-9]{1,11}){6}|v(?:,-?[0-9]{1,11}){6}(?:,-?[0-9]{1,4}){0,4})")
-STATE_META = re.compile(rb"~([0-9]{1,12}),([0-9]{1,12}),([01]),([0-3]),(-1|[0-9]{1,3}),(-|[A-Za-z0-9_]{1,32})")
+STATE_META = re.compile(rb"~([0-9]{1,12}),([0-9]{1,12}),([01]),([0-9]{1,3}),(-1|[0-9]{1,3}),(-|[A-Za-z0-9_]{1,32})(?:,(-?[0-9]{1,4}),([0-9]{1,10}),([0-4]))?")
 COMBAT_META = re.compile(rb"!([0-7]),([0-9]{1,19}),([0-2]),(-|[0-9a-f]{16})")
 WORLD_PAGE_ROWS = 5
 WORLD_MAX_PAGES = 6
-VEHICLE_TAKE = re.compile(rb"t,([0-9a-f]{16}),(-?[0-9]{1,10}),(-?[0-9]{1,10})")
-TRAFFIC_KEY = re.compile(rb"[0-9a-f]{16}:v:-?[0-9]{1,10}:-?[0-9]{1,10}")
+VEHICLE_TAKE = re.compile(rb"t,([0-9a-f]{16}),([vc]),(-?[0-9]{1,10}),(-?[0-9]{1,10})")
+TRAFFIC_KEY = re.compile(rb"[0-9a-f]{16}:[vc]:-?[0-9]{1,10}:-?[0-9]{1,10}")
 WIRE_VERSION = VERSION.encode("ascii")
 VERSION_TOKEN = re.compile(rb"[0-9]+\.[0-9]+\.[0-9]+")
 
@@ -61,7 +60,8 @@ def coordinates(fields):
     if fields and fields[-1].startswith(b"~"):
         metadata_field = fields[-1]
         match = STATE_META.fullmatch(fields[-1])
-        if not match or not -1 <= int(match[5]) <= 255:
+        if (not match or not -1 <= int(match[5]) <= 255 or int(match[4]) > 511 or
+                (match[7] is not None and (abs(int(match[7])) > 1000 or int(match[8]) > 0xFFFFFFFF))):
             raise ValueError("invalid state metadata")
         metadata = b" " + fields[-1]
         fields = fields[:-1]
@@ -148,20 +148,20 @@ def probe_connection(sock, key, version=VERSION):
     for attempt in range(3):
         legacy = attempt == 2
         challenge = secrets.token_hex(8).encode("ascii")
-        started = time.monotonic()
+        started = time.perf_counter()
         payload = b"LF-PING " + challenge
         if not legacy:
             payload += b" " + version.encode("ascii")
         sock.send(seal(key, payload))
-        deadline = time.monotonic() + 0.65
-        while (remaining := deadline - time.monotonic()) > 0:
+        deadline = time.perf_counter() + 0.65
+        while (remaining := deadline - time.perf_counter()) > 0:
             sock.settimeout(remaining)
             try:
                 response = open_packet(key, sock.recv(PACKET_LIMIT + 1))
                 if legacy and response == b"LF-PONG " + challenge:
                     raise VersionMismatch("не сообщается устаревшим сервером", version)
                 validate_reply(response, challenge, version)
-                return round((time.monotonic() - started) * 1000)
+                return round((time.perf_counter() - started) * 1000)
             except VersionMismatch:
                 raise
             except socket.timeout:
@@ -185,7 +185,7 @@ def serve(args):
         sock.settimeout(0.5)
         print(f"Listening on {args.bind}:{args.port}/UDP", flush=True)
         while True:
-            now = time.monotonic()
+            now = time.perf_counter()
             for peer, data in list(players.items()):
                 if now - data[0] >= TIMEOUT:
                     del players[peer]
@@ -221,7 +221,7 @@ def serve(args):
                 position = coordinates(fields).split(b" !", 1)[0]
             except ValueError:
                 continue
-            now = time.monotonic()
+            now = time.perf_counter()
             if player_id not in players and len(players) >= MAX_PLAYERS:
                 continue
             if player_id not in players:
@@ -258,7 +258,7 @@ class WorldExchange:
         self.next_poll = 0.0
 
     def poll(self, sock, sample):
-        now = time.monotonic()
+        now = time.perf_counter()
         if now < self.next_poll:
             return
         self.next_poll = now + 0.1
@@ -300,7 +300,7 @@ class WorldExchange:
                 sock.send(packet)
             self.last_upload = frame
         token = secrets.token_hex(8).encode("ascii")
-        self.requests[token] = (now, time.monotonic_ns(), sample, episode, {}, False)
+        self.requests[token] = (now, time.perf_counter_ns(), sample, episode, {}, False)
         sock.send(seal(self.key, b" ".join((b"LFWQ", self.player_id, token, episode))))
 
     def receive(self, response):
@@ -406,7 +406,7 @@ class PeerExchange:
         if not fields or len(fields) not in (1, 2, 7) or not response.endswith(b"\n"):
             return
         query = self.pending.pop(fields[0], None)
-        if query is None or query[1] <= self.latest or time.monotonic() - query[0] >= REPLY_WINDOW:
+        if query is None or query[1] <= self.latest or time.perf_counter() - query[0] >= REPLY_WINDOW:
             return
         if len(fields) >= 2 and fields[1] != b"-" and not PLAYER_ID.fullmatch(fields[1]):
             return
@@ -415,7 +415,7 @@ class PeerExchange:
             not all(re.fullmatch(rb"-?[0-9]{1,3}", value) for value in fields[5:])
         ):
             return
-        stamp = str(time.monotonic_ns()).encode("ascii")
+        stamp = str(time.perf_counter_ns()).encode("ascii")
         if len(fields) > 1:
             sample = str(query[1]).encode("ascii")
             stamp = b":".join((stamp, sample, self.server_address, self.player_id))
@@ -423,16 +423,13 @@ class PeerExchange:
         self.temporary.write_bytes(stamp + b"\n" + rows)
         self.temporary.replace(self.output)
         self.latest = query[1]
-        self.last_reply = time.monotonic()
+        self.last_reply = time.perf_counter()
         self.peer_count = len(rows.splitlines())
 
 
 def receive_network(sock, peer, world, deadline):
-    while (remaining := deadline - time.monotonic()) > 0:
+    while time.perf_counter() < deadline:
         try:
-            ready, _, _ = select.select([sock], [], [], remaining)
-            if not ready:
-                return
             packet = sock.recv(PACKET_LIMIT + 1)
         except OSError:
             return
@@ -476,9 +473,9 @@ def join(args, stop=None, report=print):
         status = None
         leave_retries = 0
         next_leave = 0.0
-        next_tick = time.monotonic()
+        next_tick = time.perf_counter()
         while stop is None or not stop.is_set():
-            started = time.monotonic()
+            started = time.perf_counter()
             next_tick = max(next_tick + INTERVAL, started + INTERVAL / 2)
             next_status = "Waiting for GTA IV"
             if started >= next_heartbeat:
@@ -532,18 +529,17 @@ def join(args, stop=None, report=print):
                 pass
             receive_network(sock, peer, world, next_tick)
             if next_status == "Waiting for the server" and peer.last_reply:
-                if time.monotonic() - peer.last_reply < LOSS_NOTICE:
+                if time.perf_counter() - peer.last_reply < LOSS_NOTICE:
                     next_status = f"Connected — other players: {peer.peer_count}"
                 else:
                     next_status = "Reconnecting to the server"
             if next_status != status:
                 status = next_status
                 report(status)
-            delay = max(0, next_tick - time.monotonic())
-            if stop is None:
+            # Python's Windows sleep uses a high-resolution waitable timer.
+            delay = next_tick - time.perf_counter()
+            if delay > 0:
                 time.sleep(delay)
-            else:
-                stop.wait(delay)
         try:
             peer.leave(sock)
         except OSError:

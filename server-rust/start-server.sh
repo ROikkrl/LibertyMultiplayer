@@ -7,6 +7,7 @@ export LF_BIND="${LF_BIND:-0.0.0.0}"
 export LF_PORT="${LF_PORT:-24840}"
 export LF_KEY_FILE="${LF_KEY_FILE:-session.key}"
 export LF_LOG_FILE="${LF_LOG_FILE:-server.log}"
+export LF_STATUS_FILE="${LF_STATUS_FILE:-server-status.json}"
 
 if [[ ! -e "$LF_KEY_FILE" ]]; then
     (set -o noclobber; od -An -N32 -tx1 /dev/urandom | tr -d ' \n' > "$LF_KEY_FILE")

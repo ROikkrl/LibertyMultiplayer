@@ -9,6 +9,7 @@ use std::io::{self, Write};
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 mod world;
+mod status;
 
 type PacketMac = Hmac<Sha256>;
 
@@ -228,15 +229,19 @@ fn parse_update(payload: &str, now: Instant, address: SocketAddr) -> Option<Upda
             "1" => true,
             _ => return None,
         };
-        if !matches!(parts.next()?, "0" | "1" | "2" | "3") {
+        if parts.next()?.parse::<u16>().ok()? > 511 {
             return None;
         }
         let station: i16 = parts.next()?.parse().ok()?;
         let name = parts.next()?;
         if !(-1..=255).contains(&station) || name.is_empty() || name.len() > 32 ||
-            (name != "-" && !name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')) ||
-            parts.next().is_some() {
+            (name != "-" && !name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')) {
             return None;
+        }
+        if let Some(steering) = parts.next() {
+            if !(-1000..=1000).contains(&steering.parse::<i16>().ok()?) ||
+                parts.next()?.parse::<u32>().is_err() || parts.next()?.parse::<u8>().ok()? > 4 ||
+                parts.next().is_some() { return None; }
         }
         write!(&mut state, " ~{meta}").ok()?;
     }
@@ -372,7 +377,7 @@ fn event(log: &mut Option<fs::File>, message: &str) {
 }
 
 fn reply(socket: &UdpSocket, signer: &PacketMac, payload: &[u8], sender: SocketAddr,
-         outgoing: &mut [u8], log: &mut Option<fs::File>) {
+         outgoing: &mut [u8], log: &mut Option<fs::File>, counts: &mut status::Counters) {
     let size = SIGNATURE_LEN + payload.len();
     if size > outgoing.len() {
         return;
@@ -381,10 +386,11 @@ fn reply(socket: &UdpSocket, signer: &PacketMac, payload: &[u8], sender: SocketA
     mac.update(payload);
     outgoing[..SIGNATURE_LEN].copy_from_slice(&mac.finalize().into_bytes());
     outgoing[SIGNATURE_LEN..size].copy_from_slice(payload);
-    if let Err(error) = socket.send_to(&outgoing[..size], sender) {
-        if !matches!(error.kind(), io::ErrorKind::Interrupted | io::ErrorKind::ConnectionReset) {
-            event(log, &format!("send_error {sender} {error}"));
-        }
+    match socket.send_to(&outgoing[..size], sender) {
+        Ok(sent) => { counts.outgoing += 1; counts.bytes_out += sent as u64; }
+        Err(error) if !matches!(error.kind(), io::ErrorKind::Interrupted | io::ErrorKind::ConnectionReset) =>
+            event(log, &format!("send_error {sender} {error}")),
+        Err(_) => {}
     }
 }
 
@@ -397,26 +403,30 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: Option<fs::File>) -> io:
     let mut snapshot = String::with_capacity(PACKET_LIMIT - SIGNATURE_LEN);
     let mut region_owners = HashMap::<Sector, String>::new();
     let mut world = world::World::default();
+    let mut status = status::Status::new();
     loop {
         let now = Instant::now();
         departed.retain(|_, (_, _, left)| now.duration_since(*left) < PLAYER_TIMEOUT);
         players.retain(|id, player| {
             let alive = now.duration_since(player.seen) < PLAYER_TIMEOUT;
             if !alive {
-                event(&mut log, &format!("disconnect player={id} reason=timeout"));
+                event(&mut log, &format!("disconnect player={id} ip={} reason=timeout play_seconds={}", player.address.ip(), player.play_millis / 1000));
                 world.remove(id);
             }
             alive
         });
+        status.report(now, &players, &mut world, &mut log);
         let (received, sender) = match socket.recv_from(&mut incoming) {
             Ok(message) => message,
             Err(error) if matches!(error.kind(), io::ErrorKind::Interrupted |
                 io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::ConnectionReset) => continue,
             Err(error) => return Err(error),
         };
+        status.counters.incoming += 1;
+        status.counters.bytes_in += received as u64;
         let payload = match authenticate(&incoming[..received], &signer) {
             Some(payload) => payload,
-            None => continue,
+            None => { status.counters.invalid += 1; continue; }
         };
         if let Some(probe) = payload.strip_prefix("LF-PING ") {
             let mut fields = probe.split_ascii_whitespace();
@@ -425,7 +435,8 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: Option<fs::File>) -> io:
                 if fields.next().is_some() { continue; }
                 let kind = if client_version == Some(VERSION) { "LF-PONG" } else { "LF-VERSION" };
                 let pong = format!("{kind} {challenge} {VERSION}");
-                reply(&socket, &signer, pong.as_bytes(), sender, &mut outgoing, &mut log);
+                if kind == "LF-VERSION" { status.counters.version_mismatches += 1; }
+                reply(&socket, &signer, pong.as_bytes(), sender, &mut outgoing, &mut log, &mut status.counters);
             }
             continue;
         }
@@ -434,7 +445,8 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: Option<fs::File>) -> io:
             if let (Some(id), Some(challenge)) = (fields.next(), fields.next()) {
                 if valid_id(id) && valid_id(challenge) && fields.next() != Some(VERSION) {
                     let mismatch = format!("LF-VERSION {challenge} {VERSION}");
-                    reply(&socket, &signer, mismatch.as_bytes(), sender, &mut outgoing, &mut log);
+                    status.counters.version_mismatches += 1;
+                    reply(&socket, &signer, mismatch.as_bytes(), sender, &mut outgoing, &mut log, &mut status.counters);
                     continue;
                 }
             }
@@ -448,10 +460,12 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: Option<fs::File>) -> io:
                     (departed.contains_key(id) || departed.len() < 256)
                 {
                     departed.insert(id.to_owned(), (sender, sample, Instant::now()));
-                    if players.remove(id).is_some() {
+                    if let Some(player) = players.remove(id) {
                         world.remove(id);
                         region_owners.retain(|_, owner| owner.as_str() != id);
-                        event(&mut log, &format!("disconnect player={id} reason=client"));
+                        world.reconcile(&players, Instant::now());
+                        event(&mut log, &format!("disconnect player={id} ip={} reason=client play_seconds={} online={}/{}",
+                            sender.ip(), player.play_millis / 1000, players.len(), MAX_PLAYERS));
                     }
                 }
             }
@@ -461,14 +475,14 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: Option<fs::File>) -> io:
         if ["LFWQ ", "LFWU ", "LFWT ", "LFWR "].iter().any(|prefix| payload.starts_with(prefix)) {
             if let Some(pages) = world.handle(payload, sender, &players, now) {
                 for page in pages {
-                    reply(&socket, &signer, page.as_bytes(), sender, &mut outgoing, &mut log);
+                    reply(&socket, &signer, page.as_bytes(), sender, &mut outgoing, &mut log, &mut status.counters);
                 }
             }
             continue;
         }
         let Update { id, challenge, target, vehicle_claim, player: mut update } = match parse_update(payload, now, sender) {
             Some(update) => update,
-            None => continue,
+            None => { status.counters.invalid += 1; continue; }
         };
         if !players.contains_key(id) && players.len() >= MAX_PLAYERS {
             continue;
@@ -489,8 +503,10 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: Option<fs::File>) -> io:
                 update.vehicle_origin = previous.vehicle_origin.clone();
             }
         }
-        if fresh && update.driving && vehicle_claim != "-" {
-            if !world.commit_driving(id, vehicle_claim, &update, now) {
+        if fresh && update.driving {
+            let revoked = world.revoked_vehicle(id, update.vehicle_token, update.vehicle_model);
+            if revoked || (vehicle_claim != "-" && !world.commit_driving(id, vehicle_claim, &update, &players, now)) {
+                status.counters.claims_denied += 1;
                 // Keep the accepted pose when a vehicle transfer was denied or expired.
                 if let Some(player) = players.get_mut(id) {
                     player.seen = now;
@@ -498,20 +514,23 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: Option<fs::File>) -> io:
                 } else {
                     continue;
                 }
-            } else {
+            } else if vehicle_claim != "-" {
                 update.vehicle_origin = Some(vehicle_claim.to_owned());
             }
         }
 
         if fresh {
+            status.counters.updates += 1;
             let mut previous = None;
             if let Some(player) = players.get_mut(id) {
                 if player.driving && update.driving && player.vehicle_token == update.vehicle_token {
                     previous = Some((player.position, player.sample));
                 }
                 let result = std::mem::take(&mut player.result);
+                let owned_vehicle = update.owned_vehicle.or(player.owned_vehicle)
+                    .filter(|&(token, model)| !world.revoked_vehicle(id, token, model));
                 *player = Player { result, joined: player.joined, power: player.power,
-                    owned_vehicle: update.owned_vehicle.or(player.owned_vehicle), ..update };
+                    owned_vehicle, ..update };
             } else {
                 departed.remove(id);
                 players.insert(id.to_owned(), update);
@@ -519,6 +538,8 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: Option<fs::File>) -> io:
                     sender.ip(), players.len(), MAX_PLAYERS));
             }
             simulate_hits(&mut players, id, target, previous, now, &mut log);
+        } else {
+            status.counters.stale += 1;
         }
         let local = &players[id];
         let modern = local.modern;
@@ -571,7 +592,7 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: Option<fs::File>) -> io:
             }
             snapshot.push('\n');
         }
-        reply(&socket, &signer, snapshot.as_bytes(), sender, &mut outgoing, &mut log);
+        reply(&socket, &signer, snapshot.as_bytes(), sender, &mut outgoing, &mut log, &mut status.counters);
     }
 }
 
