@@ -5,6 +5,7 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub struct EventLog {
@@ -51,11 +52,12 @@ pub struct Status {
     failed: bool,
     screen: bool,
     address: SocketAddr,
+    worker_count: usize,
     pub counters: Counters,
 }
 
 impl Status {
-    pub fn new(address: SocketAddr) -> Self {
+    pub fn new(address: SocketAddr, worker_count: usize) -> Self {
         let screen = match std::env::var("LF_SCREEN").as_deref() {
             Ok("1") => true,
             Ok("0") => false,
@@ -66,12 +68,12 @@ impl Status {
         Self {
             started: Instant::now(), cpu: process_runtime_ns(),
             path: std::env::var_os("LF_STATUS_FILE").filter(|p| !p.is_empty()).map(PathBuf::from),
-            failed: false, screen, address, counters: Counters::default(),
+            failed: false, screen, address, worker_count, counters: Counters::default(),
         }
     }
 
     pub fn report(&mut self, now: Instant, players: &HashMap<String, Player>, world: &mut World,
-                  log: &mut EventLog) {
+                  log: &mut EventLog, queue_drops: &AtomicU64) {
         for line in world.events() {
             log.record(line);
         }
@@ -82,6 +84,7 @@ impl Status {
             log.record(line);
         }
         let counts = std::mem::take(&mut self.counters);
+        let queue_drops = queue_drops.swap(0, Ordering::Relaxed);
         let seconds = elapsed.as_secs_f64();
         self.started = now;
         let cpu = process_runtime_ns();
@@ -116,6 +119,7 @@ impl Status {
                 rate(counts.outgoing), rate(counts.bytes_out) as f64 / 1024.0).unwrap();
             writeln!(screen, "      {} updates/s   {} invalid   {} stale   {} denied\n",
                 rate(counts.updates), counts.invalid, counts.stale, counts.claims_denied).unwrap();
+            writeln!(screen, " Network workers {}   Full queue drops {queue_drops}", self.worker_count).unwrap();
             writeln!(screen, " Players {}/{}   Vehicles {vehicles}   Transfers {transfers}", players.len(), MAX_PLAYERS).unwrap();
             writeln!(screen, " ID                IP               Session   Power  Score   Ep   Role").unwrap();
             for &(id, ip, seconds, power, score, episode, role) in &rows {
@@ -142,8 +146,8 @@ impl Status {
                 "{{\"id\":\"{id}\",\"ip\":\"{ip}\",\"session_seconds\":{seconds},\"power\":{power},\"score\":{score},\"episode\":{},\"role\":\"{role}\"}}",
                 episode.map_or_else(|| "null".into(), |e| e.to_string()))).collect::<Vec<_>>().join(",");
             let json = format!(
-                "{{\"online\":{},\"capacity\":{},\"hosts\":\"{hosts}\",\"players\":[{members}],\"sources\":{sources},\"vehicles\":{vehicles},\"transfers\":{transfers},\"cpu_percent\":{},\"rss_kib\":{},\"system_load_1m\":{},\"rx_packets_s\":{},\"tx_packets_s\":{},\"rx_bytes_s\":{},\"tx_bytes_s\":{},\"accepted_updates_s\":{},\"invalid_packets\":{},\"stale_updates\":{},\"claims_denied\":{},\"version_mismatches\":{}}}\n",
-                players.len(), MAX_PLAYERS, optional_float(percent), rss.map_or_else(|| "null".into(), |n| n.to_string()),
+                "{{\"online\":{},\"capacity\":{},\"hosts\":\"{hosts}\",\"players\":[{members}],\"sources\":{sources},\"vehicles\":{vehicles},\"transfers\":{transfers},\"network_workers\":{},\"queue_drops\":{queue_drops},\"cpu_percent\":{},\"rss_kib\":{},\"system_load_1m\":{},\"rx_packets_s\":{},\"tx_packets_s\":{},\"rx_bytes_s\":{},\"tx_bytes_s\":{},\"accepted_updates_s\":{},\"invalid_packets\":{},\"stale_updates\":{},\"claims_denied\":{},\"version_mismatches\":{}}}\n",
+                players.len(), MAX_PLAYERS, self.worker_count, optional_float(percent), rss.map_or_else(|| "null".into(), |n| n.to_string()),
                 optional_float(load), rate(counts.incoming), rate(counts.outgoing), rate(counts.bytes_in),
                 rate(counts.bytes_out), rate(counts.updates), counts.invalid, counts.stale, counts.claims_denied, counts.version_mismatches);
             let result = fs::write(&temporary, json).and_then(|_| fs::rename(&temporary, path));
@@ -155,9 +159,16 @@ impl Status {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn process_runtime_ns() -> Option<u64> {
-    fs::read_to_string("/proc/self/schedstat").ok()?.split_whitespace().next()?.parse().ok()
+    let mut time = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // The kernel writes a timespec for the entire process, including its UDP workers.
+    let result = unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut time) };
+    (result == 0).then(|| (time.tv_sec as u64) * 1_000_000_000 + time.tv_nsec as u64)
 }
+
+#[cfg(not(target_os = "linux"))]
+fn process_runtime_ns() -> Option<u64> { None }
 
 fn memory_kib() -> Option<u64> {
     let status = fs::read_to_string("/proc/self/status").ok()?;

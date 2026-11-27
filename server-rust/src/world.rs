@@ -165,8 +165,14 @@ struct Transfer {
     simulator: String,
     position: [f64; 3],
     until: Instant,
-    committed: bool,
+    vehicle_token: Option<i32>,
     episode: u8,
+}
+
+impl Transfer {
+    fn committed(&self) -> bool {
+        self.vehicle_token.is_some()
+    }
 }
 
 struct Traffic {
@@ -193,8 +199,13 @@ impl World {
         self.publishers.retain(|id, entry| {
             players.contains_key(id) && now.duration_since(entry.seen) < PRESENCE_TTL
         });
-        self.transfers.retain(|_, transfer| {
-            now < transfer.until && (transfer.committed || players.contains_key(&transfer.driver))
+        self.transfers.retain(|key, transfer| {
+            if let Some(token) = transfer.vehicle_token {
+                if players.get(&transfer.driver).and_then(|driver| driver.owned_vehicle) == Some((token, key.3)) {
+                    transfer.until = now + OCCUPIED_VEHICLE_TTL;
+                }
+            }
+            now < transfer.until && (transfer.committed() || players.contains_key(&transfer.driver))
         });
         let mut ordered: Vec<_> = self.publishers.iter().collect();
         ordered.sort_unstable_by_key(|(id, _)| {
@@ -295,7 +306,7 @@ impl World {
 
     pub fn remove(&mut self, id: &str) {
         self.publishers.remove(id);
-        self.transfers.retain(|_, transfer| transfer.committed || transfer.driver != id);
+        self.transfers.retain(|_, transfer| transfer.committed() || transfer.driver != id);
     }
 
     pub fn events(&mut self) -> Vec<String> {
@@ -326,7 +337,7 @@ impl World {
         let origin = state.origin.take().unwrap_or_else(|| id.to_owned());
         let key = (origin, b'v', state.id, state.model);
         if let Some(transfer) = self.transfers.get_mut(&key) {
-            if transfer.committed {
+            if transfer.committed() {
                 // Keep a tombstone while the original simulator is still publishing the old car.
                 if id == key.0 || id == transfer.simulator {
                     transfer.until = state.seen + Duration::from_secs(20);
@@ -402,7 +413,7 @@ impl World {
         }
         let key = (origin.to_owned(), mode, handle, model);
         let (simulator, episode) = if let Some(transfer) = self.transfers.get(&key).filter(|transfer| now < transfer.until) {
-            if transfer.driver != driver || (transfer.committed ||
+            if transfer.driver != driver || (transfer.committed() ||
                 self.publishers.get(driver).map(|peer| peer.episode) != Some(transfer.episode) ||
                 (mode == b'c' && self.claim_target(&key, driver, players, now).is_none()) ||
                 distance_squared(transfer.position, player.position) > 22.0_f64.powi(2)) {
@@ -423,12 +434,12 @@ impl World {
         self.traffic.remove(&key);
         self.events.push(format!("vehicle_committed player={driver} source={origin} type={} handle={handle} model={model} simulator={simulator}", char::from(mode)));
         self.transfers.insert(key, Transfer { driver: driver.to_owned(), simulator, episode,
-            position: player.position, until: now + Duration::from_secs(20), committed: true });
+            position: player.position, until: now + OCCUPIED_VEHICLE_TTL, vehicle_token: Some(player.vehicle_token) });
         true
     }
 
     pub fn revoked_vehicle(&self, id: &str, handle: i32, model: i32) -> bool {
-        self.transfers.get(&(id.to_owned(), b'c', handle, model)).map_or(false, |item| item.committed)
+        self.transfers.get(&(id.to_owned(), b'c', handle, model)).map_or(false, Transfer::committed)
     }
 
     fn transfer(&mut self, driver: &str, source: &str, mode: u8, handle: i32, model: i32,
@@ -436,7 +447,7 @@ impl World {
         let key = (source.to_owned(), mode, handle, model);
         let player = &players[driver];
         if self.transfers.contains_key(&key) || player.seated ||
-            self.transfers.values().any(|item| item.driver == driver && !item.committed) {
+            self.transfers.values().any(|item| item.driver == driver && !item.committed()) {
             return;
         }
         if let Some((position, simulator, episode)) = self.claim_target(&key, driver, players, now).filter(
@@ -444,7 +455,7 @@ impl World {
             self.events.push(format!("vehicle_reserved player={driver} source={source} type={} handle={handle} model={model}", char::from(mode)));
             self.transfers.insert(key, Transfer {
                 driver: driver.to_owned(), position, simulator, episode,
-                until: now + Duration::from_secs(3), committed: false,
+                until: now + Duration::from_secs(3), vehicle_token: None,
             });
         }
     }
@@ -624,7 +635,8 @@ impl World {
                     let distance = distance_squared(item.position, player.position);
                     if eligible && distance <= VIEW_RADIUS.powi(2) {
                         let priority = if item.kind == b'd' { 0 } else { 3 };
-                        rows.push((priority, distance, publisher_id, item.sequence, item.row.as_str()));
+                        let previous = if item.kind == b'd' { origin.vehicle_origin.as_deref() } else { None };
+                        rows.push((priority, distance, publisher_id, item.sequence, item.row.as_str(), previous));
                     }
                 }
             }
@@ -645,11 +657,11 @@ impl World {
             if transfer.episode != episode { return None; }
             let direct = transfer.driver == id || key.0 == id || transfer.simulator == id;
             let nearby = distance_squared(transfer.position, player.position) <= VIEW_RADIUS.powi(2);
-            (transfer.driver == id || transfer.committed && (direct || nearby)).then_some((!direct, key, transfer))
+            (transfer.driver == id || transfer.committed() && (direct || nearby)).then_some((!direct, key, transfer))
         }).collect();
         notices.sort_unstable_by_key(|&(indirect, key, transfer)| (indirect, transfer.driver != id, key));
         for (_, (origin, mode, handle, model), transfer) in notices.into_iter().take(12) {
-                let command = match (transfer.committed, *mode, transfer.driver == id) {
+                let command = match (transfer.committed(), *mode, transfer.driver == id) {
                     (false, b'c', _) => "takec", (true, b'c', true) => "ownc", (true, b'c', false) => "dropc",
                     (false, _, _) => "take", (true, _, true) => "own", (true, _, false) => "drop",
                 };
@@ -669,7 +681,7 @@ impl World {
             let simulation = vehicle.delegated && vehicle.simulator == id && distance <= SIMULATION_RADIUS.powi(2);
             if simulation || (vehicle.simulator != id && distance <= VIEW_RADIUS.powi(2)) {
                 let priority = if simulation { 1 } else { 2 };
-                rows.push((priority, distance, origin, vehicle.state.sequence, vehicle.state.row.as_str()));
+                rows.push((priority, distance, origin, vehicle.state.sequence, vehicle.state.row.as_str(), None));
             }
         }
         if let Some(sequence) = ambient_sequence {
@@ -680,9 +692,11 @@ impl World {
         let capacity = MAX_PAGES * PAGE_ROWS - lines.len();
         rows.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.total_cmp(&b.1))
             .then_with(|| a.2.cmp(b.2)).then_with(|| a.3.cmp(&b.3)));
-        lines.extend(rows.into_iter().take(capacity).map(|(priority, _, owner, sequence, row)| {
+        lines.extend(rows.into_iter().take(capacity).map(|(priority, _, owner, sequence, row, previous)| {
             if priority == 1 {
                 format!("{owner} {sequence} m{}\n", &row[1..])
+            } else if let Some(previous) = previous {
+                format!("{owner} {sequence} {row},{previous}\n")
             } else {
                 format!("{owner} {sequence} {row}\n")
             }
@@ -793,6 +807,44 @@ mod tests {
         world.observe_traffic(host, 0, state, &players);
         assert_eq!(world.traffic[&target].state.position[0], 57.0);
         assert_eq!(world.traffic.len(), 20);
+    }
+
+    #[test]
+    fn parked_snapshot_carries_transfer_identity_after_the_notice_timeout() {
+        let now = Instant::now();
+        let old = "aaaaaaaaaaaaaaaa";
+        let owner = "bbbbbbbbbbbbbbbb";
+        let token = "ffffffffffffffff";
+        let address = "127.0.0.1:4567".parse().unwrap();
+        let make_player = |id| {
+            let update = format!("LF1 {id} {token} {VERSION} 50 - 0 0 1 90 25 0 0 - - ~10000,10000,1,0,-1,-,0,0,1,0,0,0 !1,0,0,-");
+            parse_update(&update, now, address).unwrap().player
+        };
+        let mut players = HashMap::from([(old.to_owned(), make_player(old)), (owner.to_owned(), make_player(owner))]);
+        let mut world = World::default();
+        for id in [old, owner] { world.handle(&format!("LFWQ {id} {token} 0"), address, &players, now); }
+        let row = "v,88,-773,0,0,100,90,0,0,0,1000,0,1,0,-1,0,900,900,900,0,0,0,0,0,0";
+        world.handle(&format!("LFWU {old} 10000 0 0 1\n{row}"), address, &players, now);
+        let mut parked = make_player(owner);
+        parked.driving = true;
+        parked.vehicle_model = -773;
+        parked.vehicle_token = 3;
+        let claim = format!("{old}:v:88:-773");
+        assert!(world.commit_driving(owner, &claim, &parked, &players, now));
+        parked.driving = false;
+        parked.owned_vehicle = Some((3, -773));
+        parked.vehicle_origin = Some(claim.clone());
+        players.insert(owner.to_owned(), parked);
+
+        let later = now + Duration::from_secs(25);
+        for id in [old, owner] { world.handle(&format!("LFWQ {id} {token} 0"), address, &players, later); }
+        let parked_row = row.replacen("v,88,", "d,3,", 1);
+        world.handle(&format!("LFWU {owner} 10000 0 0 1\n{parked_row}"), address, &players, later);
+        world.handle(&format!("LFWU {old} 10100 0 0 1\n{row}"), address, &players, later);
+        let observer = world.snapshot(old, token, &players[old], &players, later).join("");
+        assert!(observer.contains(&format!("{parked_row},{claim}\n")), "{observer}");
+        assert!(observer.contains("drop,88,-773"), "{observer}");
+        assert!(!observer.contains(" v,88,-773"), "{observer}");
     }
 
     #[test]

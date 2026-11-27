@@ -223,6 +223,7 @@ public sealed class LibertyFriends : Script
     private readonly HashSet<int> publishedTraffic = new HashSet<int>();
     private readonly Dictionary<string, long> delegatedTraffic = new Dictionary<string, long>();
     private readonly Dictionary<string, long> retiredTraffic = new Dictionary<string, long>();
+    private readonly Dictionary<string, long> pendingVehicleCleanup = new Dictionary<string, long>();
     private readonly HashSet<string> occupiedCars = new HashSet<string>();
     private readonly HashSet<Vehicle> releasedCars = new HashSet<Vehicle>();
     private readonly Dictionary<string, Vehicle> releasedVehicleKeys = new Dictionary<string, Vehicle>();
@@ -411,6 +412,7 @@ public sealed class LibertyFriends : Script
         publishedTraffic.Clear();
         delegatedTraffic.Clear();
         retiredTraffic.Clear();
+        pendingVehicleCleanup.Clear();
         vehicleSignals.Clear();
         indicators = indicatorKey = 0;
         hornHeld = false;
@@ -474,7 +476,7 @@ public sealed class LibertyFriends : Script
                     trackedPlayerCar = car;
                     string nativeKey = TrafficKey(ownId, car.GetHashCode(), car.Model.Hash);
                     drivingOrigin = Equals(acquiredTraffic, car) && acquiredTrafficKey != null ? acquiredTrafficKey
-                        : sourceTraffic.ContainsKey(nativeKey) ? nativeKey : "-";
+                        : nativeKey;
                     nextRadioSample = 0;
                     nextDamageSample = 0;
                     indicators = 0;
@@ -1263,7 +1265,7 @@ public sealed class LibertyFriends : Script
                 continue;
             }
             string[] fields = parts[2].Split(',');
-            if (fields.Length != 3 && fields.Length != 11 && fields.Length != 25) continue;
+            if (fields.Length != 3 && fields.Length != 11 && fields.Length != 25 && fields.Length != 26) continue;
             int id, model;
             if (!int.TryParse(fields[1], out id) || !int.TryParse(fields[2], out model)) continue;
             string kind = fields[0];
@@ -1273,7 +1275,7 @@ public sealed class LibertyFriends : Script
                 ApplyTrafficTransfer(kind, parts[0], id, model, character);
                 continue;
             }
-            if (kind == "d" && fields.Length == 25)
+            if (kind == "d" && (fields.Length == 25 || fields.Length == 26))
             {
                 string carId = parts[0] + ":" + id.ToString(CultureInfo.InvariantCulture);
                 string parkedId = string.Format(CultureInfo.InvariantCulture, "{0}:c:{1}:{2}", parts[0], id, model);
@@ -1281,8 +1283,11 @@ public sealed class LibertyFriends : Script
                 int cx, cy, cz, yaw;
                 if (int.TryParse(fields[3], out cx) && int.TryParse(fields[4], out cy) &&
                     int.TryParse(fields[5], out cz) && int.TryParse(fields[6], out yaw))
+                {
+                    if (fields.Length == 26) AdoptRemoteVehicle(carId, fields[25], model, character);
                     ApplySharedCar(carId, new Model(model), new Vector3(cx / 100f, cy / 100f, cz / 100f),
                         yaw, fields, entitySample, now, true);
+                }
                 continue;
             }
             bool traffic = kind == "v" || kind == "m";
@@ -1309,6 +1314,7 @@ public sealed class LibertyFriends : Script
                 ApplySharedCar(key, new Model(model), position, heading, fields, entitySample, now, false, kind == "m");
             }
         }
+        FinishVehicleTransfers(character, now);
         remoteAmbientConfirmed = hasAmbientFrame;
         if (seen.Count > 0) lastAmbientAt = now;
         foreach (string key in new List<string>(worldPeds.Keys))
@@ -1386,19 +1392,17 @@ public sealed class LibertyFriends : Script
         }
         if (command == "hide" || command == "drop" || command == "dropc")
         {
-            if (command != "hide") retiredTraffic[key] = clock.ElapsedMilliseconds + 21000;
-            if (command != "hide" && pendingTake == key) takeUntil = 0;
+            if (command != "hide")
+            {
+                long now = clock.ElapsedMilliseconds;
+                RetireVehicle(key, now);
+                if (pendingTake == key) takeUntil = 0;
+                return;
+            }
             if (source == ownId)
             {
                 Vehicle original;
-                if (parked && handle == drivingToken && Exists(trackedPlayerCar) &&
-                    trackedPlayerCar.Model.Hash == model && !Equals(trackedPlayerCar, character.CurrentVehicle))
-                {
-                    original = trackedPlayerCar;
-                    trackedPlayerCar = null;
-                    DropSourceTraffic(key, original, character, true);
-                }
-                else if (sourceTraffic.TryGetValue(key, out original) && !worldCars.ContainsValue(original))
+                if (sourceTraffic.TryGetValue(key, out original) && !worldCars.ContainsValue(original))
                     DropSourceTraffic(key, original, character);
             }
             return;
@@ -1475,21 +1479,119 @@ public sealed class LibertyFriends : Script
         }
         if (car.isRequiredForMission || Equals(car, character.CurrentVehicle) ||
             (!parked && Equals(car, Player.LastVehicle)) || cars.ContainsValue(car) || worldCars.ContainsValue(car)) return;
+        if (!ClearSourceOccupants(car, character)) return;
+        car.Delete();
+        sourceTraffic.Remove(key);
+        Trace("released shared vehicle " + key);
+    }
+
+    private bool ClearSourceOccupants(Vehicle car, Ped character)
+    {
         var occupants = new List<Ped>();
         Group group = Player.Group;
         for (int seat = -1; seat < car.PassengerSeats; seat++)
         {
             Ped ped = car.GetPedOnSeat((VehicleSeat)seat);
             if (!Exists(ped)) continue;
+            if (Equals(ped, character) && seat != -1) continue;
             if (Equals(ped, character) || ped.isRequiredForMission || avatars.ContainsValue(ped) ||
-                (Exists(group) && group.isMember(ped))) return;
+                (Exists(group) && group.isMember(ped))) return false;
             occupants.Add(ped);
         }
         foreach (Ped ped in occupants)
             if (Exists(ped)) ped.Delete();
-        car.Delete();
+        return true;
+    }
+
+    private bool FindTransferVehicle(string key, string[] origin, int model, out Vehicle car)
+    {
+        if (ResolveReplica(key, out car)) return true;
+        string slot = origin[0] + ":" + origin[2];
+        if (releasedVehicleKeys.TryGetValue(origin[1] == "v" ? key : slot, out car) && Exists(car) &&
+            car.Model.Hash == model) return true;
+        if (origin[0] != ownId) return false;
+        if (origin[1] == "v") return sourceTraffic.TryGetValue(key, out car) && Exists(car);
+        car = trackedPlayerCar;
+        return origin[2] == drivingToken.ToString(CultureInfo.InvariantCulture) && Exists(car) && car.Model.Hash == model;
+    }
+
+    private void DetachTransferVehicle(string key, string[] origin, Vehicle car)
+    {
+        string slot = origin[0] + ":" + origin[2];
+        if (origin[1] == "v") ForgetTrafficReplica(key);
+        else ForgetPlayerReplica(slot);
+        releasedVehicleKeys.Remove(origin[1] == "v" ? key : slot);
+        releasedCars.Remove(car);
         sourceTraffic.Remove(key);
-        Trace("released shared vehicle " + key);
+        if (Equals(trackedPlayerCar, car)) trackedPlayerCar = null;
+        if (origin[1] == "c" && Equals(acquiredTraffic, car))
+        {
+            acquiredTraffic = null;
+            acquiredTrafficKey = null;
+        }
+        pendingVehicleCleanup.Remove(key);
+    }
+
+    private void AdoptRemoteVehicle(string destination, string key, int model, Ped character)
+    {
+        string[] origin = key.Split(':');
+        int claimedModel;
+        if (origin.Length != 4 || origin[0].Length != 16 || (origin[1] != "v" && origin[1] != "c") ||
+            !int.TryParse(origin[3], out claimedModel) || claimedModel != model ||
+            (origin[1] == "c" && destination == origin[0] + ":" + origin[2])) return;
+        RetireVehicle(key, clock.ElapsedMilliseconds);
+        Vehicle former;
+        if (!FindTransferVehicle(key, origin, model, out former) || (origin[1] == "v" && Equals(former, acquiredTraffic)) ||
+            Equals(former, drivingCar)) return;
+        if (origin[0] == ownId && !worldCars.ContainsValue(former) && !releasedCars.Contains(former) &&
+            ((origin[1] == "v" && former.isRequiredForMission) || !ClearSourceOccupants(former, character))) return;
+        Vehicle existing;
+        cars.TryGetValue(destination, out existing);
+        DetachTransferVehicle(key, origin, former);
+        GTA.Native.Function.Call("SET_CAR_AS_MISSION_CAR", former);
+        if (Exists(existing) && !Equals(existing, former))
+        {
+            if (Equals(existing, character.CurrentVehicle))
+            {
+                former.Delete();
+                return;
+            }
+            existing.Delete();
+            ForgetPlayerReplica(destination);
+        }
+        if (Equals(former, character.CurrentVehicle)) ride = destination;
+        EnableVehiclePhysics(former);
+        former.DoorLock = DoorLock.None;
+        cars[destination] = former;
+        carTracks[destination] = new PoseTrack();
+        Trace("vehicle transfer reused " + key + " -> " + destination);
+    }
+
+    private void RetireVehicle(string key, long now)
+    {
+        if (!retiredTraffic.ContainsKey(key)) pendingVehicleCleanup[key] = now + 900;
+        retiredTraffic[key] = now + 21000;
+    }
+
+    private void FinishVehicleTransfers(Ped character, long now)
+    {
+        foreach (string key in new List<string>(pendingVehicleCleanup.Keys))
+        {
+            if (now < pendingVehicleCleanup[key]) continue;
+            string[] origin = key.Split(':');
+            Vehicle car;
+            if (FindTransferVehicle(key, origin, int.Parse(origin[3], CultureInfo.InvariantCulture), out car) &&
+                !Equals(car, character.CurrentVehicle) && !(origin[1] == "v" && Equals(car, acquiredTraffic)))
+            {
+                if (origin[0] != ownId || worldCars.ContainsValue(car) || releasedCars.Contains(car))
+                {
+                    DetachTransferVehicle(key, origin, car);
+                    if (Exists(car)) car.Delete();
+                }
+                else DropSourceTraffic(key, car, character, origin[1] == "c");
+            }
+            pendingVehicleCleanup.Remove(key);
+        }
     }
 
     private void ApplySharedPed(string key, Model model, Vector3 position, int heading, Vector3 speed,
@@ -1839,7 +1941,7 @@ public sealed class LibertyFriends : Script
         foreach (var entry in worldCars)
         {
             Vehicle car = entry.Value;
-            if (!Exists(car)) continue;
+            if (!Exists(car) || retiredTraffic.ContainsKey(entry.Key)) continue;
             long delegatedUntil;
             if (delegatedTraffic.TryGetValue(entry.Key, out delegatedUntil) && now - delegatedUntil <= 1200) continue;
             PoseTrack track;
@@ -2072,24 +2174,11 @@ public sealed class LibertyFriends : Script
                 (ride != peer.CarId && SquaredDistance(character.Position, peer.Position) >
                     (cars.ContainsKey(peer.CarId) ? 14400f : 10000f))) continue;
             seen.Add(peer.CarId);
+            if (peer.VehicleOrigin != null)
+                AdoptRemoteVehicle(peer.CarId, peer.VehicleOrigin, peer.CarModel, character);
             bool newlyOccupied = occupiedCars.Add(peer.CarId);
             Vehicle car;
             bool existing = cars.TryGetValue(peer.CarId, out car) && Exists(car);
-            Vehicle former;
-            if (peer.VehicleOrigin != null)
-            {
-                retiredTraffic[peer.VehicleOrigin] = clock.ElapsedMilliseconds + 21000;
-                if (ResolveReplica(peer.VehicleOrigin, out former) && !Equals(former, car))
-                {
-                    string[] origin = peer.VehicleOrigin.Split(':');
-                    if (origin[1] == "c") ForgetPlayerReplica(origin[0] + ":" + origin[2]);
-                    else ForgetTrafficReplica(peer.VehicleOrigin);
-                    // Keep the entity the player saw before the transfer.
-                    if (existing && !Equals(character.CurrentVehicle, car)) car.Delete();
-                    if (!existing || !Exists(car)) { car = former; existing = false; }
-                    else former.Delete();
-                }
-            }
             if (!existing)
             {
                 Model model = new Model(peer.CarModel);
@@ -2144,7 +2233,9 @@ public sealed class LibertyFriends : Script
             Vehicle car = cars[id];
             if (!Exists(car)) { ForgetPlayerReplica(id); continue; }
             string owner = id.Split(':')[0];
-            bool retired = retiredTraffic.ContainsKey(ParkedKey(id, car));
+            string old = ParkedKey(id, car);
+            if (pendingVehicleCleanup.ContainsKey(old)) continue;
+            bool retired = retiredTraffic.ContainsKey(old);
             if (retired || (carTracks.TryGetValue(id, out track) &&
                 clock.ElapsedMilliseconds - track.LastSeen > 3000))
                 RemoveCar(id, !retired && !peers.ContainsKey(owner) && Exists(character) &&

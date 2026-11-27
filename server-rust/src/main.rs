@@ -7,9 +7,12 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::sync::atomic::AtomicU64;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 mod world;
 mod status;
+mod transport;
 use status::EventLog;
 
 type PacketMac = Hmac<Sha256>;
@@ -396,16 +399,15 @@ fn reply(socket: &UdpSocket, signer: &PacketMac, payload: &[u8], sender: SocketA
     }
 }
 
-fn serve(socket: UdpSocket, signer: PacketMac, mut log: EventLog) -> io::Result<()> {
-    socket.set_read_timeout(Some(Duration::from_millis(250)))?;
+fn serve(socket: &UdpSocket, signer: &PacketMac, mut log: EventLog, worker_count: usize,
+         packets: Receiver<io::Result<transport::Packet>>, queue_drops: &AtomicU64) -> io::Result<()> {
     let mut players = HashMap::<String, Player>::with_capacity(MAX_PLAYERS);
     let mut departed = HashMap::<String, (SocketAddr, u64, Instant)>::new();
-    let mut incoming = [0u8; 65_536];
     let mut outgoing = [0u8; PACKET_LIMIT];
     let mut snapshot = String::with_capacity(PACKET_LIMIT - SIGNATURE_LEN);
     let mut region_owners = HashMap::<Sector, String>::new();
     let mut world = world::World::default();
-    let mut status = status::Status::new(socket.local_addr()?);
+    let mut status = status::Status::new(socket.local_addr()?, worker_count);
     loop {
         let now = Instant::now();
         departed.retain(|_, (_, _, left)| now.duration_since(*left) < PLAYER_TIMEOUT);
@@ -417,16 +419,16 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: EventLog) -> io::Result<
             }
             alive
         });
-        status.report(now, &players, &mut world, &mut log);
-        let (received, sender) = match socket.recv_from(&mut incoming) {
-            Ok(message) => message,
-            Err(error) if matches!(error.kind(), io::ErrorKind::Interrupted |
-                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::ConnectionReset) => continue,
-            Err(error) => return Err(error),
+        status.report(now, &players, &mut world, &mut log, queue_drops);
+        let packet = match packets.recv_timeout(Duration::from_millis(250)) {
+            Ok(event) => event?,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return Err(io::Error::new(io::ErrorKind::BrokenPipe, "UDP workers stopped")),
         };
+        let sender = packet.source();
         status.counters.incoming += 1;
-        status.counters.bytes_in += received as u64;
-        let payload = match authenticate(&incoming[..received], &signer) {
+        status.counters.bytes_in += packet.size() as u64;
+        let payload = match packet.payload() {
             Some(payload) => payload,
             None => { status.counters.invalid += 1; continue; }
         };
@@ -438,7 +440,7 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: EventLog) -> io::Result<
                 let kind = if client_version == Some(VERSION) { "LF-PONG" } else { "LF-VERSION" };
                 let pong = format!("{kind} {challenge} {VERSION}");
                 if kind == "LF-VERSION" { status.counters.version_mismatches += 1; }
-                reply(&socket, &signer, pong.as_bytes(), sender, &mut outgoing, &mut log, &mut status.counters);
+                reply(socket, signer, pong.as_bytes(), sender, &mut outgoing, &mut log, &mut status.counters);
             }
             continue;
         }
@@ -448,7 +450,7 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: EventLog) -> io::Result<
                 if valid_id(id) && valid_id(challenge) && fields.next() != Some(VERSION) {
                     let mismatch = format!("LF-VERSION {challenge} {VERSION}");
                     status.counters.version_mismatches += 1;
-                    reply(&socket, &signer, mismatch.as_bytes(), sender, &mut outgoing, &mut log, &mut status.counters);
+                    reply(socket, signer, mismatch.as_bytes(), sender, &mut outgoing, &mut log, &mut status.counters);
                     continue;
                 }
             }
@@ -477,7 +479,7 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: EventLog) -> io::Result<
         if ["LFWQ ", "LFWU ", "LFWT ", "LFWR "].iter().any(|prefix| payload.starts_with(prefix)) {
             if let Some(pages) = world.handle(payload, sender, &players, now) {
                 for page in pages {
-                    reply(&socket, &signer, page.as_bytes(), sender, &mut outgoing, &mut log, &mut status.counters);
+                    reply(socket, signer, page.as_bytes(), sender, &mut outgoing, &mut log, &mut status.counters);
                 }
             }
             continue;
@@ -504,7 +506,11 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: EventLog) -> io::Result<
         }
         if fresh && update.driving {
             let revoked = world.revoked_vehicle(id, update.vehicle_token, update.vehicle_model);
-            if revoked || (vehicle_claim != "-" && !world.commit_driving(id, vehicle_claim, &update, &players, now)) {
+            // A reconnect can start inside a local car before the first world poll has identified its episode.
+            let waiting_for_episode = world.role(id).0.is_none() && world::traffic_key(vehicle_claim)
+                .map_or(false, |(origin, mode, _, model)| origin == id && mode == b'v' && model == update.vehicle_model);
+            if revoked || (vehicle_claim != "-" && !waiting_for_episode &&
+                !world.commit_driving(id, vehicle_claim, &update, &players, now)) {
                 status.counters.claims_denied += 1;
                 // Keep the accepted pose when a vehicle transfer was denied or expired.
                 if let Some(player) = players.get_mut(id) {
@@ -513,7 +519,7 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: EventLog) -> io::Result<
                 } else {
                     continue;
                 }
-            } else if vehicle_claim != "-" {
+            } else if vehicle_claim != "-" && !waiting_for_episode {
                 update.vehicle_origin = Some(vehicle_claim.to_owned());
             }
         }
@@ -591,7 +597,7 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: EventLog) -> io::Result<
             }
             snapshot.push('\n');
         }
-        reply(&socket, &signer, snapshot.as_bytes(), sender, &mut outgoing, &mut log, &mut status.counters);
+        reply(socket, signer, snapshot.as_bytes(), sender, &mut outgoing, &mut log, &mut status.counters);
     }
 }
 
@@ -601,6 +607,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     if port == 0 {
         return Err("LF_PORT must be in 1..65535".into());
     }
+    let worker_count: usize = match env::var("LF_WORKERS") {
+        Ok(value) => value.parse().map_err(|_| "LF_WORKERS must be in 1..8")?,
+        Err(env::VarError::NotPresent) => std::thread::available_parallelism().map_or(1, |value| value.get().min(4)),
+        Err(error) => return Err(error.into()),
+    };
+    if !(1..=8).contains(&worker_count) { return Err("LF_WORKERS must be in 1..8".into()); }
     let key_path = env::var_os("LF_KEY_FILE").ok_or("Set LF_KEY_FILE to the session key file")?;
     let key = fs::read_to_string(key_path)?;
     let key = key.trim_end_matches(&['\r', '\n'][..]);
@@ -613,6 +625,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut log = EventLog::new(fs::OpenOptions::new().create(true).append(true).open(file)?);
     log.record(format!("LibertyMultiplayer {VERSION} listening on {bind}:{port}/UDP"));
     log.record("world_sync protocol=LFW1 source=GTA_IV".into());
-    serve(socket, signer, log)?;
+    log.record(format!("network_workers={worker_count}"));
+    transport::run(&socket, &signer, worker_count, |packets, queue_drops| {
+        serve(&socket, &signer, log, worker_count, packets, queue_drops)
+    })?;
     Ok(())
 }
