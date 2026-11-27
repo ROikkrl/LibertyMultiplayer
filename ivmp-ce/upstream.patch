@@ -1,3 +1,40 @@
+diff --git a/Client/Core/CGame.cpp b/Client/Core/CGame.cpp
+index 92ce546..58382d8 100644
+--- a/Client/Core/CGame.cpp
++++ b/Client/Core/CGame.cpp
+@@ -255,8 +255,20 @@ void CGame::Initialize()
+ 	}
+ }
+ 
++void CGame::RefreshCompleteEditionPools()
++{
++    if (!m_pPools) m_pPools = new CPools();
++    m_pPools->Initialize();
++}
++
+ void CGame::Shutdown()
+ {
++    if (COffsets::GetVersion() == GAME_VERSION_CE_12059)
++    {
++        SAFE_DELETE(m_pPools);
++        return;
++    }
++
+ 	// Shutdown our game class instances
+ 	SAFE_DELETE(m_pWorld);
+ 	SAFE_DELETE(m_pWeather);
+diff --git a/Client/Core/CGame.h b/Client/Core/CGame.h
+index 049d8bd..181b107 100644
+--- a/Client/Core/CGame.h
++++ b/Client/Core/CGame.h
+@@ -100,6 +100,7 @@ public:
+ 	static DWORD           GetTime();
+ 	static void            UnprotectMemory();
+ 	static void            Initialize();
++	static void            RefreshCompleteEditionPools();
+ 	static void            Shutdown();
+ 	static bool            IsMenuActive();
+ 	static void            SetTime(int uHour, int uMinute);
 diff --git a/Client/Core/COffsets.cpp b/Client/Core/COffsets.cpp
 index 9dc6716..f78d764 100644
 --- a/Client/Core/COffsets.cpp
@@ -201,19 +238,51 @@ index 1170246..e6e0585 100644
  template <typename T>
  struct CSimpleCollection
 diff --git a/Client/Core/Main.cpp b/Client/Core/Main.cpp
-index eca31da..681912f 100644
+index eca31da..2ee2d0c 100644
 --- a/Client/Core/Main.cpp
 +++ b/Client/Core/Main.cpp
-@@ -10,6 +10,8 @@
+@@ -10,9 +10,40 @@
  #include <windows.h>
  #include <Common.h>
  #include "CClient.h"
 +#include "COffsets.h"
-+#include "CompleteEdition/CEBindings.h"
++#include "CGame.h"
++#include "CompleteEdition/CEFrame.h"
++#include "CompleteEdition/CELocalPlayer.h"
  
  CClient * g_pClient = NULL;
  
-@@ -22,6 +24,24 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
++namespace
++{
++void OnCompleteEditionFrame(const ivmp_ce::Engine& engine)
++{
++    if (CGame::GetPools())
++    {
++        CGame::RefreshCompleteEditionPools();
++        return;
++    }
++
++    static ULONGLONG nextProbe = 0;
++    const auto now = GetTickCount64();
++    if (now < nextProbe) return;
++    nextProbe = now + 100;
++
++    const auto pools = engine.Pools();
++    if (!pools || !*pools.peds || !*pools.vehicles) return;
++    ivmp_ce::LocalPlayer player;
++    if (!ivmp_ce::LocalPlayerReader(engine).Read(player)) return;
++    const auto ped = pools.ResolvePed(player.ped);
++    if (!ped || pools.encode(*pools.peds, ped) != player.ped) return;
++
++    CGame::RefreshCompleteEditionPools();
++    OutputDebugStringW(L"IV:MP CE: game thread and entity pools ready.\n");
++}
++}
++
+ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
+ {
+ 	switch(fdwReason)
+@@ -22,6 +53,35 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
  			// Disable thread library notifications
  			DisableThreadLibraryCalls(hModule);
  
@@ -228,8 +297,19 @@ index eca31da..681912f 100644
 +					OutputDebugStringW(L"IV:MP CE: GTAIV.exe failed binding validation.\n");
 +					return FALSE;
 +				}
-+				// Leave the scheduler and game pools alone until their CE-specific client paths exist.
-+				OutputDebugStringW(L"IV:MP CE: engine bindings resolved; multiplayer bootstrap is pending.\n");
++				auto& pump = ivmp_ce::FramePump::Instance();
++				if (!pump.Install({ image }, OnCompleteEditionFrame))
++				{
++					OutputDebugStringW(L"IV:MP CE: script call site is unavailable.\n");
++					return FALSE;
++				}
++				HMODULE pinned = nullptr;
++				if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
++					reinterpret_cast<LPCWSTR>(&OnCompleteEditionFrame), &pinned))
++				{
++					pump.Remove();
++					return FALSE;
++				}
 +				return TRUE;
 +			}
 +
@@ -238,7 +318,7 @@ index eca31da..681912f 100644
  			// Create the client instance
  			g_pClient = new CClient();
  
-@@ -37,7 +57,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
+@@ -37,7 +97,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
  	case DLL_PROCESS_DETACH:
  		{
  			// Call the client OnUnload function
