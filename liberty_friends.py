@@ -20,7 +20,7 @@ WORLD_ENTITY = re.compile(rb"(?:p(?:,-?[0-9]{1,11}){6}|v(?:,-?[0-9]{1,11}){6}(?:
 STATE_META = re.compile(rb"~([0-9]{1,12}),([0-9]{1,12}),([01]),([0-9]{1,3}),(-1|[0-9]{1,3}),(-|[A-Za-z0-9_]{1,32})(?:,(-?[0-9]{1,4}),([0-9]{1,10}),([0-4])(?:,(-?[0-9]{1,5}),(-?[0-9]{1,5}),(-?[0-9]{1,4}))?)?")
 COMBAT_META = re.compile(rb"!([0-7]),([0-9]{1,19}),([0-2]),(-|[0-9a-f]{16})")
 WORLD_PAGE_ROWS = 5
-WORLD_MAX_PAGES = 6
+WORLD_MAX_PAGES = 12
 VEHICLE_TAKE = re.compile(rb"t,([0-9a-f]{16}),([vc]),(-?[0-9]{1,10}),(-?[0-9]{1,10})")
 TRAFFIC_KEY = re.compile(rb"[0-9a-f]{16}:[vc]:-?[0-9]{1,10}:-?[0-9]{1,10}")
 WIRE_VERSION = VERSION.encode("ascii")
@@ -273,7 +273,7 @@ class WorldExchange:
         except OSError:
             return
         lines = frame.splitlines()
-        if not lines or not frame.endswith(b"\n") or len(lines) > 1 + WORLD_PAGE_ROWS * WORLD_MAX_PAGES:
+        if not lines or not frame.endswith(b"\n") or len(lines) > 2 + WORLD_PAGE_ROWS * WORLD_MAX_PAGES:
             return
         header = lines[0].split()
         if len(header) != 3 or header[0] != self.player_id or not header[1].isdigit():
@@ -287,6 +287,8 @@ class WorldExchange:
                 take = VEHICLE_TAKE.fullmatch(rows.pop(0))
                 if take:
                     sock.send(seal(self.key, b" ".join((b"LFWT", self.player_id, *take.groups()))))
+            if len(rows) > WORLD_PAGE_ROWS * WORLD_MAX_PAGES:
+                return
             total = max(1, (len(rows) + WORLD_PAGE_ROWS - 1) // WORLD_PAGE_ROWS)
             packets = []
             for page in range(total):

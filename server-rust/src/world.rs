@@ -3,19 +3,20 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-const MAX_PAGES: usize = 6;
+const MAX_PAGES: usize = 12;
 const PAGE_ROWS: usize = 5;
 const SOURCE_RADIUS: f64 = 90.0;
 const KEEP_SOURCE_RADIUS: f64 = 105.0;
 const CAPTURE_RADIUS: f64 = 150.0;
 const VIEW_RADIUS: f64 = 118.0;
+const TRAFFIC_CELL: f64 = 64.0;
 const FRAME_TTL: Duration = Duration::from_millis(1200);
 const PRESENCE_TTL: Duration = Duration::from_millis(1800);
 const VEHICLE_TTL: Duration = Duration::from_secs(3);
 const OCCUPIED_VEHICLE_TTL: Duration = Duration::from_secs(20);
 const SIMULATION_RADIUS: f64 = 115.0;
 const MAX_TRAFFIC: usize = 384;
-const MAX_DELEGATED: usize = 8;
+const MAX_DELEGATED: usize = 20;
 const MAX_PRIORITY_SECONDS: u64 = 3600;
 const WORLD_REPLY_TTL: Duration = Duration::from_secs(2);
 const WORLD_REPLY_LIMIT: usize = 20;
@@ -111,6 +112,11 @@ fn bounded(raw: &str, min: i32, max: i32) -> Option<i32> {
     (min..=max).contains(&value).then_some(value)
 }
 
+fn traffic_cell_center(position: [f64; 3]) -> [f64; 3] {
+    let center = |axis: f64| (axis.div_euclid(TRAFFIC_CELL) + 0.5) * TRAFFIC_CELL;
+    [center(position[0]), center(position[1]), position[2]]
+}
+
 struct Frame {
     sequence: u64,
     at: Instant,
@@ -168,6 +174,7 @@ struct Traffic {
     simulator: String,
     episode: u8,
     delegated: bool,
+    assigned_at: Instant,
 }
 
 #[derive(Default)]
@@ -227,24 +234,22 @@ impl World {
                 }
             }
         }
-        // Atmospheric traffic is valid only while this game instance owns the area.
+        // Pedestrian frames follow the area's crowd source. Vehicles keep their simulator.
         for (id, publisher) in &mut self.publishers {
             let was_source = self.sources.get(id) == Some(id);
             let is_source = sources.get(id) == Some(id);
             if was_source != is_source {
-                publisher.incoming.clear();
                 if let Some(frame) = &mut publisher.frame {
                     frame.ambient = false;
                     frame.entities.retain(|item| item.kind == b'd');
                 }
             }
         }
-        self.reconcile_traffic(players, &sources, now);
+        self.reconcile_traffic(players, now);
         self.sources = sources;
     }
 
-    fn reconcile_traffic(&mut self, players: &HashMap<String, Player>, sources: &HashMap<String, String>,
-                         now: Instant) {
+    fn reconcile_traffic(&mut self, players: &HashMap<String, Player>, now: Instant) {
         let publishers = &self.publishers;
         let nearby = |vehicle: &Traffic, id: &str, radius: f64| {
             publishers.get(id).map_or(false, |peer| peer.episode == vehicle.episode &&
@@ -258,26 +263,31 @@ impl World {
 
         let can_keep = |vehicle: &Traffic| {
             nearby(vehicle, &vehicle.simulator, SIMULATION_RADIUS) &&
-                now.duration_since(vehicle.state.seen) < FRAME_TTL &&
-                (vehicle.delegated || sources.get(&vehicle.simulator) == Some(&vehicle.simulator))
+                (now.duration_since(vehicle.state.seen) < FRAME_TTL ||
+                    vehicle.delegated && now.duration_since(vehicle.assigned_at) < FRAME_TTL)
         };
         let mut delegated = HashMap::<String, usize>::new();
         for vehicle in self.traffic.values().filter(|vehicle| vehicle.delegated && can_keep(vehicle)) {
             *delegated.entry(vehicle.simulator.clone()).or_default() += 1;
         }
-        for vehicle in self.traffic.values_mut().filter(|vehicle| !can_keep(vehicle)) {
+        let mut waiting: Vec<_> = self.traffic.iter_mut().filter(|(_, vehicle)| !can_keep(vehicle)).collect();
+        let approach = |vehicle: &Traffic| {
+            publishers.iter().filter(|(_, publisher)| publisher.episode == vehicle.episode)
+                .map(|(id, _)| distance_squared(players[id].position, vehicle.state.position))
+                .fold(f64::INFINITY, f64::min)
+        };
+        waiting.sort_unstable_by(|a, b| approach(a.1).total_cmp(&approach(b.1)).then_with(|| a.0.cmp(b.0)));
+        for (_, vehicle) in waiting {
             let available = publishers.keys().filter(|id| nearby(vehicle, id, SIMULATION_RADIUS) &&
                 delegated.get(*id).copied().unwrap_or(0) < MAX_DELEGATED);
             let best = available.min_by(|a, b| {
-                let rank = |id: &String| {
-                    (sources.get(id) != Some(id), std::cmp::Reverse(priority(players[id].power,
-                        players[id].session_seconds(now))), players[id].joined)
-                };
-                rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
+                let distance = |id: &String| distance_squared(players[id].position, vehicle.state.position);
+                distance(a).total_cmp(&distance(b)).then_with(|| a.cmp(b))
             });
             if let Some(id) = best {
                 vehicle.simulator = id.clone();
                 vehicle.delegated = true;
+                vehicle.assigned_at = now;
                 *delegated.entry(id.clone()).or_default() += 1;
             }
         }
@@ -311,7 +321,8 @@ impl World {
         (Some(publisher.episode), role)
     }
 
-    fn observe_traffic(&mut self, id: &str, episode: u8, mut state: Entity) {
+    fn observe_traffic(&mut self, id: &str, episode: u8, mut state: Entity,
+                       players: &HashMap<String, Player>) {
         let origin = state.origin.take().unwrap_or_else(|| id.to_owned());
         let key = (origin, b'v', state.id, state.model);
         if let Some(transfer) = self.transfers.get_mut(&key) {
@@ -328,13 +339,33 @@ impl World {
             if vehicle.simulator != id || vehicle.episode != episode || vehicle.delegated != delegated {
                 return;
             }
-        } else if delegated || self.traffic.len() >= MAX_TRAFFIC {
-            return;
+        } else {
+            if delegated || self.traffic.len() >= MAX_TRAFFIC {
+                return;
+            }
+            // Choose a donor when the vehicle first appears, then keep its identity
+            // and simulator as it crosses the boundaries of subsequent cells.
+            let center = traffic_cell_center(state.position);
+            let donor = self.publishers.iter().filter_map(|(candidate, publisher)| {
+                let player = players.get(candidate)?;
+                if publisher.episode != episode ||
+                    distance_squared(state.position, player.position) > CAPTURE_RADIUS.powi(2) {
+                    return None;
+                }
+                Some((candidate, distance_squared(center, player.position), player.joined))
+            }).min_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.2.cmp(&b.2)).then_with(|| a.0.cmp(b.0)));
+            if donor.map(|(candidate, _, _)| candidate.as_str()) != Some(id) ||
+                self.traffic.values().any(|vehicle| vehicle.episode == episode &&
+                    vehicle.state.model == state.model && vehicle.simulator != id &&
+                    distance_squared(vehicle.state.position, state.position) < 4.0) {
+                return;
+            }
         }
         let epoch = self.traffic_epoch.get_or_insert(state.seen);
         let at = 1 + state.seen.duration_since(*epoch).as_millis() as u64;
         state.sequence = self.traffic.get(&key).map_or(at, |vehicle| at.max(vehicle.state.sequence + 1));
-        self.traffic.insert(key, Traffic { state, simulator: id.to_owned(), episode, delegated });
+        let assigned_at = self.traffic.get(&key).map_or(state.seen, |vehicle| vehicle.assigned_at);
+        self.traffic.insert(key, Traffic { state, simulator: id.to_owned(), episode, delegated, assigned_at });
     }
 
     fn claim_target(&self, key: &TrafficKey, driver: &str, players: &HashMap<String, Player>, now: Instant)
@@ -431,7 +462,7 @@ impl World {
         match action {
             "LFWR" => {
                 let challenge = fields.next()?;
-                let mask: u8 = fields.next()?.parse().ok()?;
+                let mask: u16 = fields.next()?.parse().ok()?;
                 if fields.next().is_some() || !body.is_empty() || !valid_id(challenge) {
                     return None;
                 }
@@ -508,7 +539,6 @@ impl World {
                     sequence.abs_diff(player.sample) > 1500 {
                     return None;
                 }
-                self.reconcile(players, now);
                 let owns_area = self.sources.get(id).map_or(false, |source| source == id);
                 let publisher = self.publishers.get_mut(id)?;
                 if episode != publisher.episode ||
@@ -553,13 +583,14 @@ impl World {
                                 player.owned_vehicle == Some((item.id, item.model)) && distance <= radius.powi(2)
                             }
                             b'm' => distance <= SIMULATION_RADIUS.powi(2),
+                            b'v' => distance <= CAPTURE_RADIUS.powi(2),
                             _ => owns_area && distance <= CAPTURE_RADIUS.powi(2),
                         };
                         authorized && unique.insert((item.kind, item.origin.clone(), item.id))
                     }).partition::<Vec<_>, _>(|item| matches!(item.kind, b'v' | b'm'));
                     publisher.frame = Some(Frame { sequence, at: now, ambient: owns_area, entities });
                     for state in traffic {
-                        self.observe_traffic(id, episode, state);
+                        self.observe_traffic(id, episode, state, players);
                     }
                 }
                 None
@@ -602,6 +633,14 @@ impl World {
         if let Some(host) = self.hosts.get(&episode) {
             lines.push(format!("{host} 0 #\n"));
         }
+        let mut local: Vec<_> = self.traffic.iter().filter(|((origin, _, _, _), vehicle)| {
+            origin == id && vehicle.episode == episode && !vehicle.delegated &&
+                vehicle.simulator == id && now.duration_since(vehicle.state.seen) < FRAME_TTL
+        }).collect();
+        local.sort_unstable_by(|a, b| b.1.state.sequence.cmp(&a.1.state.sequence).then_with(|| a.0.cmp(b.0)));
+        let handles = local.iter().take(32).map(|((_, _, handle, _), _)| format!("{handle:x}"))
+            .collect::<Vec<_>>().join(",");
+        lines.push(format!("{id} 0 +{handles}\n"));
         let mut notices: Vec<_> = self.transfers.iter().filter_map(|(key, transfer)| {
             if transfer.episode != episode { return None; }
             let direct = transfer.driver == id || key.0 == id || transfer.simulator == id;
@@ -621,7 +660,8 @@ impl World {
                 continue;
             }
             let distance = distance_squared(vehicle.state.position, player.position);
-            if vehicle.delegated && origin == id && vehicle.simulator != id {
+            if vehicle.delegated && vehicle.state.kind == b'm' && vehicle.state.seen >= vehicle.assigned_at &&
+                origin == id && vehicle.simulator != id {
                 if distance <= SIMULATION_RADIUS.powi(2) {
                     lines.push(format!("{origin} 0 hide,{handle},{model}\n"));
                 }
@@ -706,6 +746,53 @@ mod tests {
         assert!(world.commit_driving(driver, &claim, &moving, &players, now));
         assert!(world.traffic.is_empty());
         assert!(!world.commit_driving(host, &claim, &moving, &players, now));
+    }
+
+    #[test]
+    fn road_authority_is_local_and_survives_cell_crossing() {
+        let now = Instant::now();
+        let host = "aaaaaaaaaaaaaaaa";
+        let peer = "bbbbbbbbbbbbbbbb";
+        let token = "ffffffffffffffff";
+        let address = "127.0.0.1:4567".parse().unwrap();
+        let player = |id, x, power, joined| {
+            let message = format!("LF1 {id} {token} {VERSION} {power} - {x} 32 1 90 25 0 0 - - ~10000,10000,1,0,-1,-,0,0,1,0,0,0 !1,0,0,-");
+            parse_update(&message, joined, address).unwrap().player
+        };
+        let mut players = HashMap::from([
+            (host.to_owned(), player(host, 32, 99, now - Duration::from_secs(90))),
+            (peer.to_owned(), player(peer, 95, 40, now - Duration::from_secs(30))),
+        ]);
+        let mut world = World::default();
+        for id in [host, peer] {
+            world.handle(&format!("LFWQ {id} {token} 0"), address, &players, now);
+        }
+        assert_eq!(world.sources[peer], host);
+        let row = |kind, handle, x| {
+            format!("{kind},{handle},-773,{x},3200,100,90,0,0,0,1000,0,231,3,-1,0,900,900,900,0,10,-40,1,-999,0")
+        };
+        for handle in 1..=20 {
+            let state = Entity::parse(&row("v", handle, 6400 + handle * 130), now, 10000).unwrap();
+            world.observe_traffic(peer, 0, state, &players);
+        }
+        assert_eq!(world.traffic.len(), 20);
+        let duplicate = Entity::parse(&row("v", 89, 9000), now, 10000).unwrap();
+        world.observe_traffic(host, 0, duplicate, &players);
+        assert_eq!(world.traffic.len(), 20);
+        let target = (peer.to_owned(), b'v', 1, -773);
+        let crosses = Entity::parse(&row("v", 1, 6000), now + Duration::from_millis(100), 10100).unwrap();
+        world.observe_traffic(peer, 0, crosses, &players);
+        assert_eq!(world.traffic[&target].state.position[0], 60.0);
+
+        players.get_mut(peer).unwrap().position = [260.0, 32.0, 1.0];
+        let handoff = now + Duration::from_millis(200);
+        world.reconcile(&players, handoff);
+        assert!(world.traffic[&target].delegated);
+        assert_eq!(world.traffic[&target].simulator, host);
+        let state = Entity::parse(&format!("{},{peer}", row("m", 1, 5700)), handoff, 10200).unwrap();
+        world.observe_traffic(host, 0, state, &players);
+        assert_eq!(world.traffic[&target].state.position[0], 57.0);
+        assert_eq!(world.traffic.len(), 20);
     }
 
     #[test]

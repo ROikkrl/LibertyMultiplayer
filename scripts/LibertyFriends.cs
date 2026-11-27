@@ -64,6 +64,9 @@ public sealed class LibertyFriends : Script
         public long SampledAt;
         public long PositionAt;
         public Vector3 Position, Velocity;
+        public long DetailsUntil;
+        public int Model, EngineHealth, BodyHealth, TankHealth, Tires;
+        public uint Colors;
     }
 
     private sealed class AvatarGait
@@ -92,6 +95,8 @@ public sealed class LibertyFriends : Script
         public long LastSeen, AppliedAt, NextIdleCheck, NextWheelSpeed;
         public Vector3 Presented;
         public Quaternion? PresentedOrientation;
+        public IntPtr Wheels;
+        public float[] WheelRadii, WheelPhases;
 
         public void Add(long sample, long now, Vector3 position, float heading, Quaternion? rotation, Vector3? speed)
         {
@@ -165,6 +170,12 @@ public sealed class LibertyFriends : Script
     private readonly Stopwatch clock = Stopwatch.StartNew();
     private readonly string directory;
     private readonly bool hasCeVehicleLayout;
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)]
+    private delegate void SetWheelSteering(IntPtr wheel, float radians);
+    private readonly SetWheelSteering setWheelSteering;
+    private readonly byte[] wheelLayout = new byte[8];
+    private readonly byte[] wheelSurface = new byte[0x78];
+    private readonly float[] wheelPhaseValue = new float[1];
     private readonly byte[] vehicleMemory = new byte[0x3DC];
     private readonly Dictionary<int, Vector3[]> lampPositions = new Dictionary<int, Vector3[]>();
     private const int Engine = 1, Siren = 2, Headlights = 4, HornOn = 8,
@@ -197,8 +208,10 @@ public sealed class LibertyFriends : Script
     private long lastSharedFrame, lastSharedAt, lastAmbientAt, nextSharedCapture, nextSharedSpawn, nextAmbientCleanup;
     private long nextPopulationCheck, nextAmbientDiscovery;
     private Vector3 lastAmbientDiscoveryPosition;
-    private readonly List<Vehicle> ambientCars = new List<Vehicle>(10);
-    private readonly List<Ped> ambientPeds = new List<Ped>(17);
+    private const int AmbientCarLimit = 28;
+    private const int AmbientPedLimit = 17;
+    private readonly List<Vehicle> ambientCars = new List<Vehicle>(AmbientCarLimit);
+    private readonly List<Ped> ambientPeds = new List<Ped>(AmbientPedLimit);
     private int episode = -1;
     private bool suppressingPopulation, remoteAmbientConfirmed;
     private string pendingTake;
@@ -207,6 +220,7 @@ public sealed class LibertyFriends : Script
     private Vehicle acquiredTraffic;
     private string acquiredTrafficKey;
     private readonly Dictionary<string, Vehicle> sourceTraffic = new Dictionary<string, Vehicle>();
+    private readonly HashSet<int> publishedTraffic = new HashSet<int>();
     private readonly Dictionary<string, long> delegatedTraffic = new Dictionary<string, long>();
     private readonly Dictionary<string, long> retiredTraffic = new Dictionary<string, long>();
     private readonly HashSet<string> occupiedCars = new HashSet<string>();
@@ -252,12 +266,16 @@ public sealed class LibertyFriends : Script
         string game = Path.GetDirectoryName(module.FileName);
         directory = Path.Combine(game, "mods", "LibertyFriends");
         hasCeVehicleLayout = MatchesVehicleLayout(module.BaseAddress);
+        if (hasCeVehicleLayout && MatchesWheelLayout(module.BaseAddress))
+            setWheelSteering = (SetWheelSteering)Marshal.GetDelegateForFunctionPointer(
+                IntPtr.Add(module.BaseAddress, 0x6D05A0), typeof(SetWheelSteering));
         Interval = 0;
         KeyDown += HandleKey;
         KeyUp += ReleaseKey;
         Tick += Update;
         Trace("mod loaded; waiting for launcher and a loaded save");
         Trace("CE vehicle telemetry=" + (hasCeVehicleLayout ? "enabled" : "fallback"));
+        Trace("CE wheel animation=" + (setWheelSteering != null ? "enabled" : "fallback"));
         Trace("vehicle movement uses buffered coordinate samples");
     }
 
@@ -390,6 +408,7 @@ public sealed class LibertyFriends : Script
         pendingTake = null;
         acquiredTrafficKey = null;
         sourceTraffic.Clear();
+        publishedTraffic.Clear();
         delegatedTraffic.Clear();
         retiredTraffic.Clear();
         vehicleSignals.Clear();
@@ -831,7 +850,7 @@ public sealed class LibertyFriends : Script
             foreach (int handle in new List<int>(vehicleSignals.Keys))
                 if (sample - Math.Max(vehicleSignals[handle].SampledAt, vehicleSignals[handle].PositionAt) > 15000)
                     vehicleSignals.Remove(handle);
-        int remaining = 29;
+        int remaining = 60;
         frame.AppendFormat(CultureInfo.InvariantCulture, "{0} {1} {2}\n", ownId, sample, episode);
         if (pendingTake != null && !takeMounted)
         {
@@ -858,7 +877,7 @@ public sealed class LibertyFriends : Script
                 car, -1, false, driverModel, sample)).Append(',').Append(key[0]).Append('\n');
             if (--remaining == 0) break;
         }
-        if (sharedSource == ownId && peers.Count != 0)
+        if (peers.Count != 0)
         {
             Vector3 origin = local.Position;
             if (sample >= nextAmbientDiscovery || SquaredDistance(origin, lastAmbientDiscoveryPosition) > 625f)
@@ -867,7 +886,9 @@ public sealed class LibertyFriends : Script
             {
                 if (remaining == 0) break;
                 if (!CanPublishCar(car, localCar)) continue;
-                sourceTraffic[TrafficKey(ownId, car.GetHashCode(), car.Model.Hash)] = car;
+                string key = TrafficKey(ownId, car.GetHashCode(), car.Model.Hash);
+                if (retiredTraffic.ContainsKey(key)) continue;
+                sourceTraffic[key] = car;
                 Ped driver = car.GetPedOnSeat(VehicleSeat.Driver);
                 int driverModel = Exists(driver) && !avatars.ContainsValue(driver) ? driver.Model.Hash : 0;
                 frame.Append(CaptureVehicleDetails("v", car.GetHashCode(), car, -1, false, driverModel, sample)).Append('\n');
@@ -876,7 +897,7 @@ public sealed class LibertyFriends : Script
 
             foreach (Ped ped in ambientPeds)
             {
-                if (remaining == 0) break;
+                if (sharedSource != ownId || remaining == 0) break;
                 if (!CanPublishPed(ped, local) || worldDrivers.ContainsValue(ped)) continue;
                 Vector3 velocity = ped.Velocity;
                 frame.Append(WorldRow("p", ped.GetHashCode(), ped.Model.Hash, ped.Position, ped.Heading))
@@ -905,15 +926,16 @@ public sealed class LibertyFriends : Script
                 nearbyCars.Add(new KeyValuePair<float, Vehicle>(SquaredDistance(origin, car.Position), car));
         nearbyCars.Sort((a, b) => a.Key.CompareTo(b.Key));
         ambientCars.Clear();
-        for (int i = 0; i < Math.Min(10, nearbyCars.Count); i++) ambientCars.Add(nearbyCars[i].Value);
+        for (int i = 0; i < Math.Min(AmbientCarLimit, nearbyCars.Count); i++) ambientCars.Add(nearbyCars[i].Value);
 
         var nearbyPeds = new List<KeyValuePair<float, Ped>>();
+        ambientPeds.Clear();
+        if (sharedSource != ownId) return;
         foreach (Ped ped in World.GetPeds(origin, 145f, 60))
             if (CanPublishPed(ped, local) && !worldDrivers.ContainsValue(ped))
                 nearbyPeds.Add(new KeyValuePair<float, Ped>(SquaredDistance(origin, ped.Position), ped));
         nearbyPeds.Sort((a, b) => a.Key.CompareTo(b.Key));
-        ambientPeds.Clear();
-        for (int i = 0; i < Math.Min(17, nearbyPeds.Count); i++) ambientPeds.Add(nearbyPeds[i].Value);
+        for (int i = 0; i < Math.Min(AmbientPedLimit, nearbyPeds.Count); i++) ambientPeds.Add(nearbyPeds[i].Value);
     }
 
     private static int TireMask(Vehicle car)
@@ -934,8 +956,18 @@ public sealed class LibertyFriends : Script
         Vector3 velocity = SampleVehicleVelocity(car, position, now);
         Vector3 direction = car.Direction;
         float forward = velocity.X * direction.X + velocity.Y * direction.Y;
-        uint colors = (uint)(car.Color.Index & 255) | ((uint)(car.FeatureColor1.Index & 255) << 8) |
-            ((uint)(car.SpecularColor.Index & 255) << 16) | ((uint)(car.FeatureColor2.Index & 255) << 24);
+        VehicleSignal details = SignalsFor(car);
+        if (now >= details.DetailsUntil || details.Model != model.Hash)
+        {
+            details.Model = model.Hash;
+            details.DetailsUntil = now + 400;
+            details.Colors = (uint)(car.Color.Index & 255) | ((uint)(car.FeatureColor1.Index & 255) << 8) |
+                ((uint)(car.SpecularColor.Index & 255) << 16) | ((uint)(car.FeatureColor2.Index & 255) << 24);
+            details.EngineHealth = (int)Math.Max(-4000, Math.Min(1000, car.EngineHealth));
+            details.BodyHealth = Math.Max(0, Math.Min(1000, car.Health));
+            details.TankHealth = (int)Math.Max(-4000, Math.Min(1000, car.PetrolTankHealth));
+            details.Tires = TireMask(car);
+        }
         int flags = (car.EngineRunning ? Engine : 0) | (car.SirenActive ? Siren : 0) |
             (kind == "d" && Equals(car, drivingCar) ? indicators : 0) | (horn ? HornOn : 0);
         int steering = 0, alarm = 0;
@@ -947,10 +979,8 @@ public sealed class LibertyFriends : Script
         return WorldRow(kind, id, model.Hash, position, car.Heading) +
             string.Format(CultureInfo.InvariantCulture, ",{0},{1},{2},{3},{4},{5},{6},{7},{8},{9},{10},{11},{12},{13},{14},{15},{16},{17}",
                 (int)Math.Round(q.X * 1000), (int)Math.Round(q.Y * 1000), (int)Math.Round(q.Z * 1000),
-                (int)Math.Round(q.W * 1000), colors, flags, hornNumber, station, driverModel,
-                (int)Math.Max(-4000, Math.Min(1000, car.EngineHealth)),
-                Math.Max(0, Math.Min(1000, car.Health)),
-                (int)Math.Max(-4000, Math.Min(1000, car.PetrolTankHealth)), TireMask(car),
+                (int)Math.Round(q.W * 1000), details.Colors, flags, hornNumber, station, driverModel,
+                details.EngineHealth, details.BodyHealth, details.TankHealth, details.Tires,
                 SpeedUnits(velocity.X, 150), SpeedUnits(velocity.Y, 150), SpeedUnits(velocity.Z, 60), steering, alarm);
     }
 
@@ -987,6 +1017,18 @@ public sealed class LibertyFriends : Script
             MatchesInstruction(module, 0x7CE998, new byte[] { 0x66, 0x89, 0x88, 0x48, 0x0F, 0, 0 }) &&
             MatchesInstruction(module, 0x7CEF44, new byte[] { 0x89, 0x86, 0xEC, 0x12, 0, 0 }) &&
             MatchesInstruction(module, 0x7CA4DF, new byte[] { 0x0F, 0xB6, 0x90, 0x94, 0x0F, 0, 0 });
+    }
+
+    private static bool MatchesWheelLayout(IntPtr module)
+    {
+        // Complete Edition 1.2.0.59. Verify the wheel-array initializers, stride,
+        // steering setter, and the fields read by the wheel bone renderer.
+        return MatchesInstruction(module, 0x831D81, new byte[] { 0x8D, 0xBE, 0xD0, 0x14, 0, 0, 0x89, 0xBE, 0x80, 0x0F, 0, 0 }) &&
+            MatchesInstruction(module, 0x8EAFFE, new byte[] { 0x8D, 0x8F, 0x50, 0x14, 0, 0, 0x89, 0x8F, 0x80, 0x0F, 0, 0 }) &&
+            MatchesInstruction(module, 0x833FDD, new byte[] { 0x81, 0xC3, 0x70, 1, 0, 0, 0x3B, 0xB7, 0x84, 0x0F, 0, 0 }) &&
+            MatchesInstruction(module, 0x6D05A0, new byte[] { 0x8B, 0x81, 0x3C, 1, 0, 0, 0x8B, 0x91, 0x64, 1, 0, 0 }) &&
+            MatchesInstruction(module, 0x6CF91F, new byte[] { 0xF3, 0x0F, 0x10, 0x87, 0x3C, 1, 0, 0 }) &&
+            MatchesInstruction(module, 0x6CFAD7, new byte[] { 0xF3, 0x0F, 0x10, 0x47, 0x7C });
     }
 
     private bool ReadRoadMemory(Vehicle car, out IntPtr address)
@@ -1072,7 +1114,6 @@ public sealed class LibertyFriends : Script
     {
         if (value == suppressingPopulation) return;
         float density = value ? 0f : 1f;
-        GTA.Native.Function.Call("SET_CAR_DENSITY_MULTIPLIER", density);
         GTA.Native.Function.Call("SET_PED_DENSITY_MULTIPLIER", density);
         suppressingPopulation = value;
         Trace(value ? "local ambient population suppressed" : "local ambient population restored");
@@ -1086,14 +1127,16 @@ public sealed class LibertyFriends : Script
             now - lastSharedAt < 500;
         bool canClear = following && Player.CanControlCharacter && character.isAlive && !Player.isOnMission;
         SetPopulationSuppressed(canClear && (remoteAmbientConfirmed || (lastAmbientAt > 0 && now - lastAmbientAt < 900)));
-        if (!canClear || !remoteAmbientConfirmed || now < nextAmbientCleanup || character.isGettingIntoAVehicle)
+        if ((!canClear && worldCars.Count == 0) || !serverConnected || peers.Count == 0 ||
+            !Player.CanControlCharacter || !character.isAlive ||
+            Player.isOnMission || now < nextAmbientCleanup || character.isGettingIntoAVehicle)
             return;
 
         nextAmbientCleanup = now + 1100;
-        ClearLocalPopulation(character);
+        ClearLocalPopulation(character, canClear && remoteAmbientConfirmed, now);
     }
 
-    private void ClearLocalPopulation(Ped character)
+    private void ClearLocalPopulation(Ped character, bool clearPeds, long now)
     {
         var protectedPeds = new HashSet<Ped>(avatars.Values);
         protectedPeds.UnionWith(worldPeds.Values);
@@ -1123,11 +1166,21 @@ public sealed class LibertyFriends : Script
         }
 
         var obsoleteCars = new HashSet<Vehicle>();
+        var sharedPositions = new List<Vector3>();
+        foreach (var entry in worldCars)
+        {
+            PoseTrack track;
+            if (Exists(entry.Value) && worldTracks.TryGetValue(entry.Key, out track) && now - track.LastSeen < 650)
+                sharedPositions.Add(entry.Value.Position);
+        }
         foreach (Vehicle car in World.GetVehicles(center, 90f))
         {
             if (obsoleteCars.Count >= 8) break;
-            if (Exists(car) && !protectedCars.Contains(car) && !car.isRequiredForMission && !car.Model.isTrain)
-                obsoleteCars.Add(car);
+            if (!Exists(car) || protectedCars.Contains(car) || car.isRequiredForMission || car.Model.isTrain) continue;
+            int handle = car.GetHashCode();
+            if (publishedTraffic.Contains(handle)) continue;
+            Vector3 position = car.Position;
+            if (sharedPositions.Exists(point => SquaredDistance(point, position) < 9f)) obsoleteCars.Add(car);
         }
         int pedestriansRemoved = 0;
         foreach (Ped ped in loadedPeds)
@@ -1138,7 +1191,7 @@ public sealed class LibertyFriends : Script
             {
                 if (obsoleteCars.Contains(vehicle)) ped.Delete();
             }
-            else if (pedestriansRemoved < 14)
+            else if (clearPeds && pedestriansRemoved < 14)
             {
                 ped.Delete();
                 pedestriansRemoved++;
@@ -1166,6 +1219,7 @@ public sealed class LibertyFriends : Script
 
         lastSharedFrame = frame;
         lastSharedAt = now;
+        publishedTraffic.Clear();
         foreach (string key in new List<string>(retiredTraffic.Keys))
             if (now >= retiredTraffic[key]) retiredTraffic.Remove(key);
         string source = header[4];
@@ -1184,6 +1238,16 @@ public sealed class LibertyFriends : Script
             string[] parts = lines[i].Split(' ');
             long entitySample;
             if (parts.Length != 3 || parts[0].Length != 16 || !long.TryParse(parts[1], out entitySample)) continue;
+            if (parts[0] == ownId && parts[2].StartsWith("+", StringComparison.Ordinal))
+            {
+                foreach (string handle in parts[2].Substring(1).Split(','))
+                {
+                    int value;
+                    if (int.TryParse(handle, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out value))
+                        publishedTraffic.Add(value);
+                }
+                continue;
+            }
             if (parts[2] == "#")
             {
                 if (globalWorldHost != parts[0])
@@ -1228,7 +1292,7 @@ public sealed class LibertyFriends : Script
                 !int.TryParse(fields[5], out z) || !int.TryParse(fields[6], out heading)) continue;
             var position = new Vector3(x / 100f, y / 100f, z / 100f);
             string key = traffic ? TrafficKey(parts[0], id, model) : source + ":p:" + fields[1] + ":" + fields[2];
-            float radius = kind == "m" || worldTracks.ContainsKey(key) ? 120f : 103f;
+            float radius = kind == "m" || worldTracks.ContainsKey(key) ? 124f : 118f;
             if (SquaredDistance(character.Position, position) > radius * radius) continue;
             if (kind == "p" && fields.Length == 11)
             {
@@ -2391,6 +2455,47 @@ public sealed class LibertyFriends : Script
         return new Vector3(presented.X + step.X, presented.Y + step.Y, presented.Z + step.Z);
     }
 
+    private void AnimateReplicaWheels(Vehicle car, PoseTrack track, VehicleDetails detail, float distance, long now)
+    {
+        if (setWheelSteering == null) return;
+        bool automobile = car.Model.isCar;
+        if (!automobile && !car.Model.isBike) return;
+        IntPtr address = new IntPtr(((GTA.@base.iAddressableObject)car).MemoryAddress);
+        if (address == IntPtr.Zero || !ReadGameMemory(IntPtr.Add(address, 0xF80), wheelLayout)) return;
+        IntPtr wheels = new IntPtr(BitConverter.ToInt32(wheelLayout, 0));
+        int count = BitConverter.ToInt32(wheelLayout, 4);
+        if (wheels != IntPtr.Add(address, automobile ? 0x14D0 : 0x1450) ||
+            count < 1 || count > (automobile ? 6 : 2)) return;
+        if (track.Wheels != wheels || track.WheelRadii == null || track.WheelRadii.Length != count)
+        {
+            var radii = new float[count];
+            var phases = new float[count];
+            for (int i = 0; i < count; i++)
+            {
+                if (!ReadGameMemory(IntPtr.Add(wheels, 0x170 * i + 8), wheelSurface)) return;
+                float radius = BitConverter.ToSingle(wheelSurface, 0);
+                if (!(radius >= 0.10f && radius <= 2f)) return;
+                radii[i] = radius;
+                float phase = BitConverter.ToSingle(wheelSurface, 0x7C - 8);
+                phases[i] = Math.Abs(phase) <= 3.15f ? phase : 0f;
+            }
+            track.Wheels = wheels;
+            track.WheelRadii = radii;
+            track.WheelPhases = phases;
+        }
+        float steering = detail != null && now - detail.SignalAt < 750 ? detail.Steering * 0.58f : 0f;
+        for (int i = 0; i < count; i++)
+        {
+            IntPtr wheel = IntPtr.Add(wheels, 0x170 * i);
+            setWheelSteering(wheel, steering);
+            if (distance == 0f) continue;
+            float phase = (float)Math.IEEERemainder(track.WheelPhases[i] - distance / track.WheelRadii[i], 2 * Math.PI);
+            track.WheelPhases[i] = phase;
+            wheelPhaseValue[0] = phase;
+            Marshal.Copy(wheelPhaseValue, 0, IntPtr.Add(wheel, 0x7C), 1);
+        }
+    }
+
     private void SetCarPose(string key, Vehicle car, PoseTrack track, long now, int buffer, int cadence)
     {
         if (Equals(car, drivingCar)) return;
@@ -2429,14 +2534,17 @@ public sealed class LibertyFriends : Script
         }
         else if (moving) car.Heading = pose.Heading;
 
-        // Velocity here only drives the wheel animation. It is never used to place the replica.
-        if (moving && cadence == 0 && now >= track.NextWheelSpeed && (car.Model.isCar || car.Model.isBike))
+        if (moving || now >= track.NextWheelSpeed)
         {
             track.NextWheelSpeed = now + 100;
-            Vector3 direction = car.Direction;
-            float roll = pose.Velocity.X * direction.X + pose.Velocity.Y * direction.Y;
-            if (Math.Abs(roll) > 0.6f)
-                GTA.Native.Function.Call("SET_CAR_FORWARD_SPEED", car, Math.Max(-100f, Math.Min(100f, roll)));
+            float distance = 0f;
+            if (moving)
+            {
+                Vector3 direction = car.Direction;
+                distance = (next.X - presented.X) * direction.X + (next.Y - presented.Y) * direction.Y +
+                    (next.Z - presented.Z) * direction.Z;
+            }
+            AnimateReplicaWheels(car, track, detail, distance, now);
         }
     }
 
