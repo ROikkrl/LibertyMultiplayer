@@ -7,6 +7,24 @@
 
 namespace ivmp_ce
 {
+inline bool PageIsExecutable(const std::uint8_t* begin, std::size_t size);
+
+struct EntityPools
+{
+    using LookupHandle = void* (__thiscall*)(void*, std::uint32_t);
+    using EncodeHandle = std::uint32_t (__thiscall*)(void*, const void*);
+
+    void** peds = nullptr;
+    void** vehicles = nullptr;
+    LookupHandle lookup = nullptr;
+    EncodeHandle encode = nullptr;
+
+    explicit operator bool() const { return peds && vehicles && lookup && encode; }
+
+    void* ResolvePed(std::uint32_t handle) const { return peds && *peds && lookup && handle ? lookup(*peds, handle) : nullptr; }
+    void* ResolveVehicle(std::uint32_t handle) const { return vehicles && *vehicles && lookup && handle ? lookup(*vehicles, handle) : nullptr; }
+};
+
 struct Engine
 {
     const std::uint8_t* base = nullptr;
@@ -33,6 +51,27 @@ struct Engine
     {
         const auto get = reinterpret_cast<ActiveThread>(Address(Binding::ActiveScriptThread));
         return get ? get() : nullptr;
+    }
+
+    EntityPools Pools() const
+    {
+        if (!base) return {};
+        constexpr std::uint32_t pedGlobal = 0x14B6F1C, vehicleGlobal = 0xEE22A4;
+        constexpr std::uint32_t atHandle = 0x99D20, handleOf = 0xB7020;
+        const auto address = reinterpret_cast<std::uintptr_t>(base);
+
+        // Check the relocated operands in the three native wrappers before
+        // trusting either data slot. The helper calls are tied to these wrappers
+        // by the exact rel32 bytes in the Steam profile.
+        std::uint32_t pedOperand = 0, carOperand = 0, playerOperand = 0;
+        std::memcpy(&pedOperand, base + Rva(Binding::PedPoolNativePath) + 6, sizeof(pedOperand));
+        std::memcpy(&carOperand, base + Rva(Binding::VehiclePoolNativePath) + 6, sizeof(carOperand));
+        std::memcpy(&playerOperand, base + Rva(Binding::PedHandleNativePath) + 11, sizeof(playerOperand));
+        if (pedOperand != address + pedGlobal || playerOperand != pedOperand || carOperand != address + vehicleGlobal ||
+            !PageIsExecutable(base + atHandle, 1) || !PageIsExecutable(base + handleOf, 1)) return {};
+        return { reinterpret_cast<void**>(pedOperand), reinterpret_cast<void**>(carOperand),
+            reinterpret_cast<EntityPools::LookupHandle>(address + atHandle),
+            reinterpret_cast<EntityPools::EncodeHandle>(address + handleOf) };
     }
 
     // The CE collider uses aligned 16-byte vectors. IV:MP's CVector3 occupies

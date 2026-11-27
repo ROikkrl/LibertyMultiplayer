@@ -1,5 +1,5 @@
 diff --git a/Client/Core/COffsets.cpp b/Client/Core/COffsets.cpp
-index 9dc6716..1145181 100644
+index 9dc6716..f78d764 100644
 --- a/Client/Core/COffsets.cpp
 +++ b/Client/Core/COffsets.cpp
 @@ -9,6 +9,7 @@
@@ -10,7 +10,7 @@ index 9dc6716..1145181 100644
  
  eGameVersion COffsets::m_GameVersion = GAME_VERSION_UNKNOWN;
  
-@@ -224,6 +225,23 @@ unsigned int COffsets::FUNC_CPedWeapons__RemoveAllWeapons = 0;
+@@ -224,6 +225,28 @@ unsigned int COffsets::FUNC_CPedWeapons__RemoveAllWeapons = 0;
  void COffsets::Init(unsigned int uiBase)
  {
  	m_GameVersion = GAME_VERSION_UNKNOWN;
@@ -19,7 +19,8 @@ index 9dc6716..1145181 100644
 +	if (ivmp_ce::IsCompleteEditionBuild(ivmp_ce::PeHeader(image)))
 +	{
 +		const auto engine = ivmp_ce::ResolveLoadedModule(module);
-+		if (engine)
++		const auto pools = engine.Pools();
++		if (pools)
 +		{
 +			m_GameVersion = GAME_VERSION_CE_12059;
 +			FUNC_ScrVM__FindNativeAddress = static_cast<unsigned int>(engine.Address(ivmp_ce::Binding::FindNative));
@@ -28,6 +29,10 @@ index 9dc6716..1145181 100644
 +			FUNC_CPhysical__SetMoveSpeed = static_cast<unsigned int>(engine.Address(ivmp_ce::Binding::SetMoveSpeed));
 +			FUNC_CPhysical__GetTurnSpeed = static_cast<unsigned int>(engine.Address(ivmp_ce::Binding::GetTurnSpeed));
 +			FUNC_CPhysical__SetTurnSpeed = static_cast<unsigned int>(engine.Address(ivmp_ce::Binding::SetTurnSpeed));
++			VAR_PedPool = reinterpret_cast<unsigned int>(pools.peds);
++			VAR_VehiclePool = reinterpret_cast<unsigned int>(pools.vehicles);
++			FUNC_CPool__AtHandle = reinterpret_cast<unsigned int>(pools.lookup);
++			FUNC_CPool__HandleOf = reinterpret_cast<unsigned int>(pools.encode);
 +		}
 +		return;
 +	}
@@ -46,16 +51,53 @@ index 846101b..fe23e94 100644
  };
  
  class COffsets
+diff --git a/Client/Core/CPools.cpp b/Client/Core/CPools.cpp
+index 207cab5..42a690a 100644
+--- a/Client/Core/CPools.cpp
++++ b/Client/Core/CPools.cpp
+@@ -20,6 +20,9 @@ CPools::CPools()
+ 	// Clear our custom checkpoint array
+ 	memset(&m_checkpoints, 0, sizeof(m_checkpoints));
+ 
++	if (COffsets::GetVersion() == GAME_VERSION_CE_12059)
++		return;
++
+ 	// Modify checkpoint rendering to use our custom array
+ 	/*
+ 	VAR_RenderCheckpoints_FirstCP                   = (uiBase +  0x855966);
+@@ -73,6 +76,20 @@ void CPools::SetVehicleStructPoolLimit(BYTE byteLimit)
+ 
+ void CPools::Initialize()
+ {
++    if (COffsets::GetVersion() == GAME_VERSION_CE_12059)
++    {
++        auto pedPool = *reinterpret_cast<IVPool**>(COffsets::VAR_PedPool);
++        auto vehiclePool = *reinterpret_cast<IVPool**>(COffsets::VAR_VehiclePool);
++
++        // The engine owns both pools. Keep existing wrappers when the game
++        // reloads and refresh their pointers to the active pools.
++        if (!m_pPedPool) m_pPedPool = new CIVPool<IVPed>();
++        if (!m_pVehiclePool) m_pVehiclePool = new CIVPool<IVVehicle>();
++        m_pPedPool->SetPool(pedPool);
++        m_pVehiclePool->SetPool(vehiclePool);
++        return;
++    }
++
+     // Initialize game pools
+     m_pPedPool = new CIVPool<IVPed>(*(IVPool **)COffsets::VAR_PedPool);
+     m_pVehiclePool = new CIVPool<IVVehicle>(*(IVPool **)COffsets::VAR_VehiclePool);
 diff --git a/Client/Core/Client.Core.vcxproj b/Client/Core/Client.Core.vcxproj
-index 775d25e..2d8a791 100644
+index 775d25e..3d282c1 100644
 --- a/Client/Core/Client.Core.vcxproj
 +++ b/Client/Core/Client.Core.vcxproj
-@@ -161,6 +161,8 @@
+@@ -161,6 +161,10 @@
      <ClInclude Include="CGameFileChecker.h" />
      <ClInclude Include="CModelManager.h" />
      <ClInclude Include="COffsets.h" />
 +    <ClInclude Include="CompleteEdition\CEProfile.h" />
 +    <ClInclude Include="CompleteEdition\CEBindings.h" />
++    <ClInclude Include="CompleteEdition\CEFrame.h" />
++    <ClInclude Include="CompleteEdition\CELocalPlayer.h" />
      <ClInclude Include="CPools.h" />
      <ClInclude Include="Indicators.h" />
      <ClInclude Include="IV\CIVCam.h" />
@@ -123,6 +165,28 @@ index 31c8920..68ec6ee 100644
  		CVector3 * pVecTurnSpeed = &vecTurnSpeed;
  		_asm
  		{
+diff --git a/Client/Core/IV/CIVPool.h b/Client/Core/IV/CIVPool.h
+index 843d488..9013cf0 100644
+--- a/Client/Core/IV/CIVPool.h
++++ b/Client/Core/IV/CIVPool.h
+@@ -60,7 +60,7 @@ public:
+ 	{
+ 		T * pObject = NULL;
+ 
+-		if(m_pPool)
++		if(m_pPool && COffsets::FUNC_CPool__Allocate)
+ 		{
+ 			IVPool * pPool = m_pPool;
+ 			_asm
+@@ -140,7 +140,7 @@ public:
+ 
+ 	void Release(T * pObject)
+ 	{
+-		if(m_pPool)
++		if(m_pPool && COffsets::FUNC_CPool__Release)
+ 		{
+ 			IVPool * pPool = m_pPool;
+ 			_asm
 diff --git a/Client/Core/IVCommon.h b/Client/Core/IVCommon.h
 index 1170246..e6e0585 100644
 --- a/Client/Core/IVCommon.h
@@ -229,6 +293,18 @@ index b3aea70..28b77be 100644
  		{
  			push esi
  			mov esi, uiHash
+diff --git a/Client/CrashReporter/Client.CrashReporter.vcxproj b/Client/CrashReporter/Client.CrashReporter.vcxproj
+index 854794d..20f5769 100644
+--- a/Client/CrashReporter/Client.CrashReporter.vcxproj
++++ b/Client/CrashReporter/Client.CrashReporter.vcxproj
+@@ -64,6 +64,7 @@
+     <ClCompile>
+       <WarningLevel>Level3</WarningLevel>
+       <Optimization>MaxSpeed</Optimization>
++      <AdditionalIncludeDirectories>..\..\Shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+       <FunctionLevelLinking>true</FunctionLevelLinking>
+       <IntrinsicFunctions>true</IntrinsicFunctions>
+       <PreprocessorDefinitions>WIN_32;WIN32;_CRT_SECURE_NO_WARNINGS;_CRT_SECURE_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
 diff --git a/Shared/CEvents.h b/Shared/CEvents.h
 index 6e9026a..61086d7 100644
 --- a/Shared/CEvents.h
@@ -243,3 +319,32 @@ index 6e9026a..61086d7 100644
  		return pReturn;
  	}
  
+diff --git a/Shared/Math/CMath.h b/Shared/Math/CMath.h
+index 6a89075..5ba5eb5 100644
+--- a/Shared/Math/CMath.h
++++ b/Shared/Math/CMath.h
+@@ -12,7 +12,9 @@
+ #pragma once
+ 
+ #ifdef WIN32
++#pragma pack(push, 8)
+ #include <windows.h>
++#pragma pack(pop)
+ #else
+ typedef unsigned long DWORD;
+ #include <string.h>
+diff --git a/Shared/SharedUtility.h b/Shared/SharedUtility.h
+index 39dbf2d..d4341bb 100644
+--- a/Shared/SharedUtility.h
++++ b/Shared/SharedUtility.h
+@@ -12,8 +12,10 @@
+ #pragma once
+ 
+ #ifdef WIN32
++#pragma pack(push, 8)
+ #include <WinSock2.h>
+ #include <windows.h>
++#pragma pack(pop)
+ #else
+ #include <sys/time.h>
+ typedef unsigned long DWORD;
