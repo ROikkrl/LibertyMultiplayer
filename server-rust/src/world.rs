@@ -8,7 +8,7 @@ const PAGE_ROWS: usize = 5;
 const SOURCE_RADIUS: f64 = 90.0;
 const KEEP_SOURCE_RADIUS: f64 = 105.0;
 const CAPTURE_RADIUS: f64 = 150.0;
-const VIEW_RADIUS: f64 = 100.0;
+const VIEW_RADIUS: f64 = 118.0;
 const FRAME_TTL: Duration = Duration::from_millis(1200);
 const PRESENCE_TTL: Duration = Duration::from_millis(1800);
 const VEHICLE_TTL: Duration = Duration::from_secs(3);
@@ -21,8 +21,8 @@ const WORLD_REPLY_TTL: Duration = Duration::from_secs(2);
 const WORLD_REPLY_LIMIT: usize = 20;
 const INCOMING_LIMIT: usize = 6;
 
-fn priority(power: u8, elapsed: Duration) -> u64 {
-    u64::from(power) * elapsed.as_secs().min(MAX_PRIORITY_SECONDS)
+pub fn priority(power: u8, seconds: u64) -> u64 {
+    u64::from(power) * seconds.min(MAX_PRIORITY_SECONDS)
 }
 
 struct Entity {
@@ -55,7 +55,7 @@ impl Entity {
             return None;
         }
         let mut position = [0.0; 3];
-        let scale = if kind == b'p' { 10 } else { 100 };
+        let scale = 100;
         for axis in &mut position {
             let value = bounded(fields.next()?, -20_000 * scale, 20_000 * scale)?;
             *axis = f64::from(value) / f64::from(scale);
@@ -63,6 +63,9 @@ impl Entity {
         bounded(fields.next()?, 0, 359)?;
         if kind == b'p' {
             bounded(fields.next()?, 0, 4)?;
+            for _ in 0..3 {
+                bounded(fields.next()?, -3000, 3000)?;
+            }
         } else {
             let mut norm = 0;
             for _ in 0..4 {
@@ -81,6 +84,7 @@ impl Entity {
             bounded(fields.next()?, 0, 1000)?;
             bounded(fields.next()?, -4000, 1000)?;
             bounded(fields.next()?, -1, 15)?;
+            bounded(fields.next()?, -15_000, 15_000)?;
             bounded(fields.next()?, -15_000, 15_000)?;
             bounded(fields.next()?, -6_000, 6_000)?;
             bounded(fields.next()?, -1_000, 1_000)?;
@@ -172,7 +176,7 @@ pub struct World {
     sources: HashMap<String, String>,
     transfers: HashMap<TrafficKey, Transfer>,
     traffic: HashMap<TrafficKey, Traffic>,
-    traffic_revision: u64,
+    traffic_epoch: Option<Instant>,
     hosts: HashMap<u8, String>,
     events: Vec<String>,
 }
@@ -188,7 +192,7 @@ impl World {
         let mut ordered: Vec<_> = self.publishers.iter().collect();
         ordered.sort_unstable_by_key(|(id, _)| {
             let player = &players[*id];
-            (std::cmp::Reverse(priority(player.power, Duration::from_millis(u64::from(player.play_millis)))),
+            (std::cmp::Reverse(priority(player.power, player.session_seconds(now))),
                 player.joined, id.as_str())
         });
         let mut sources = HashMap::with_capacity(ordered.len());
@@ -213,10 +217,11 @@ impl World {
                 let before = old_hosts.get(&episode).map_or("-", String::as_str);
                 if let Some(id) = self.hosts.get(&episode) {
                     let player = &players[id];
-                    let score = priority(player.power, Duration::from_millis(u64::from(player.play_millis)));
+                    let seconds = player.session_seconds(now);
+                    let score = priority(player.power, seconds);
                     self.events.push(format!(
-                        "host_change episode={episode} previous={before} player={id} ip={} power={} play_seconds={} priority={score}",
-                        player.address.ip(), player.power, player.play_millis / 1000));
+                        "host_change episode={episode} previous={before} player={id} ip={} power={} session_seconds={seconds} priority={score}",
+                        player.address.ip(), player.power));
                 } else {
                     self.events.push(format!("host_change episode={episode} previous={before} player=-"));
                 }
@@ -266,7 +271,7 @@ impl World {
             let best = available.min_by(|a, b| {
                 let rank = |id: &String| {
                     (sources.get(id) != Some(id), std::cmp::Reverse(priority(players[id].power,
-                        Duration::from_millis(u64::from(players[id].play_millis)))), players[id].joined)
+                        players[id].session_seconds(now))), players[id].joined)
                 };
                 rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
             });
@@ -294,6 +299,18 @@ impl World {
         (hosts, self.traffic.len(), self.sources.len(), self.transfers.len())
     }
 
+    pub fn role(&self, id: &str) -> (Option<u8>, &'static str) {
+        let Some(publisher) = self.publishers.get(id) else { return (None, "connecting"); };
+        let role = if self.hosts.get(&publisher.episode).map(String::as_str) == Some(id) {
+            "host"
+        } else if self.sources.get(id).map(String::as_str) == Some(id) {
+            "area source"
+        } else {
+            "player"
+        };
+        (Some(publisher.episode), role)
+    }
+
     fn observe_traffic(&mut self, id: &str, episode: u8, mut state: Entity) {
         let origin = state.origin.take().unwrap_or_else(|| id.to_owned());
         let key = (origin, b'v', state.id, state.model);
@@ -314,8 +331,9 @@ impl World {
         } else if delegated || self.traffic.len() >= MAX_TRAFFIC {
             return;
         }
-        self.traffic_revision += 1;
-        state.sequence = self.traffic_revision;
+        let epoch = self.traffic_epoch.get_or_insert(state.seen);
+        let at = 1 + state.seen.duration_since(*epoch).as_millis() as u64;
+        state.sequence = self.traffic.get(&key).map_or(at, |vehicle| at.max(vehicle.state.sequence + 1));
         self.traffic.insert(key, Traffic { state, simulator: id.to_owned(), episode, delegated });
     }
 
@@ -651,11 +669,11 @@ mod tests {
 
     #[test]
     fn hosting_priority_caps_session_time_not_power() {
-        assert_eq!(priority(50, Duration::from_millis(5_900)), 250);
-        assert!(priority(95, Duration::from_secs(20)) > priority(40, Duration::from_secs(40)));
-        assert!(priority(15, Duration::from_secs(40)) > priority(99, Duration::from_secs(5)));
-        assert_eq!(priority(99, Duration::from_secs(7_200)), 99 * 3_600);
-        assert_eq!(priority(1, Duration::from_secs(7_200)), 3_600);
+        assert_eq!(priority(50, 5), 250);
+        assert!(priority(95, 20) > priority(40, 40));
+        assert!(priority(15, 40) > priority(99, 5));
+        assert_eq!(priority(99, 7_200), 99 * 3_600);
+        assert_eq!(priority(1, 7_200), 3_600);
     }
 
     #[test]
@@ -666,7 +684,7 @@ mod tests {
         let token = "ffffffffffffffff";
         let address = "127.0.0.1:4567".parse().unwrap();
         let initial = |id, power| format!(
-            "LF1 {id} {token} {VERSION} {power} 15000 - 0 0 1 90 25 0 0 - - ~10000,10000,1,0,-1,-,0,0,1 !1,0,0,-");
+            "LF1 {id} {token} {VERSION} {power} - 0 0 1 90 25 0 0 - - ~10000,10000,1,0,-1,-,0,0,1,100,-500,2 !1,0,0,-");
         let players = HashMap::from([
             (host.to_owned(), parse_update(&initial(host, 99), now, address).unwrap().player),
             (driver.to_owned(), parse_update(&initial(driver, 40), now, address).unwrap().player),
@@ -675,7 +693,7 @@ mod tests {
         for id in [host, driver] {
             world.handle(&format!("LFWQ {id} {token} 0"), address, &players, now);
         }
-        let row = "v,88,-773,0,0,100,90,0,0,0,1000,0,231,3,-1,0,900,900,900,0,10,1,-999,0";
+        let row = "v,88,-773,0,0,100,90,0,0,0,1000,0,231,3,-1,0,900,900,900,0,10,-40,1,-999,0";
         assert!(Entity::parse(row, now, 10000).is_some());
         world.handle(&format!("LFWU {host} 10000 0 0 1\n{row}"), address, &players, now);
         assert_eq!(world.traffic.len(), 1);
@@ -688,5 +706,33 @@ mod tests {
         assert!(world.commit_driving(driver, &claim, &moving, &players, now));
         assert!(world.traffic.is_empty());
         assert!(!world.commit_driving(host, &claim, &moving, &players, now));
+    }
+
+    #[test]
+    fn host_priority_restarts_on_new_session() {
+        let now = Instant::now();
+        let first = "aaaaaaaaaaaaaaaa";
+        let second = "bbbbbbbbbbbbbbbb";
+        let token = "ffffffffffffffff";
+        let address = "127.0.0.1:4567".parse().unwrap();
+        let connect = |id, power, at| {
+            let message = format!("LF1 {id} {token} {VERSION} {power} - 0 0 1");
+            parse_update(&message, at, address).unwrap().player
+        };
+        let mut players = HashMap::from([
+            (first.to_owned(), connect(first, 99, now - Duration::from_secs(20))),
+            (second.to_owned(), connect(second, 40, now - Duration::from_secs(10))),
+        ]);
+        let mut world = World::default();
+        for id in [first, second] {
+            world.handle(&format!("LFWQ {id} {token} 0"), address, &players, now);
+        }
+        assert_eq!(world.role(first).1, "host");
+        players.remove(first);
+        world.remove(first);
+        players.insert(first.to_owned(), connect(first, 99, now));
+        world.handle(&format!("LFWQ {first} {token} 0"), address, &players, now);
+        assert_eq!(players[first].session_seconds(now), 0);
+        assert_eq!(world.role(second).1, "host");
     }
 }

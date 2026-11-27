@@ -5,11 +5,12 @@ use std::env;
 use std::error::Error;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 mod world;
 mod status;
+use status::EventLog;
 
 type PacketMac = Hmac<Sha256>;
 
@@ -27,7 +28,6 @@ struct Player {
     joined: Instant,
     seen: Instant,
     power: u8,
-    play_millis: u32,
     address: SocketAddr,
     modern: bool,
     shares_world: bool,
@@ -41,6 +41,12 @@ struct Player {
     seated: bool,
     combat: Option<CombatInput>,
     result: CombatResult,
+}
+
+impl Player {
+    fn session_seconds(&self, now: Instant) -> u64 {
+        now.saturating_duration_since(self.joined).as_secs()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -117,7 +123,6 @@ fn parse_update(payload: &str, now: Instant, address: SocketAddr) -> Option<Upda
     if !(1..=99).contains(&power) {
         return None;
     }
-    let play_millis = fields.next()?.parse::<u32>().ok()?.min(3_600_000);
     let vehicle_claim = fields.next()?;
     if vehicle_claim != "-" && world::traffic_key(vehicle_claim).is_none() {
         return None;
@@ -240,8 +245,15 @@ fn parse_update(payload: &str, now: Instant, address: SocketAddr) -> Option<Upda
         }
         if let Some(steering) = parts.next() {
             if !(-1000..=1000).contains(&steering.parse::<i16>().ok()?) ||
-                parts.next()?.parse::<u32>().is_err() || parts.next()?.parse::<u8>().ok()? > 4 ||
-                parts.next().is_some() { return None; }
+                parts.next()?.parse::<u32>().is_err() || parts.next()?.parse::<u8>().ok()? > 4 {
+                return None;
+            }
+            if let Some(x) = parts.next() {
+                if !(-15_000..=15_000).contains(&x.parse::<i16>().ok()?) ||
+                    !(-15_000..=15_000).contains(&parts.next()?.parse::<i16>().ok()?) ||
+                    !(-6_000..=6_000).contains(&parts.next()?.parse::<i16>().ok()?) ||
+                    parts.next().is_some() { return None; }
+            }
         }
         write!(&mut state, " ~{meta}").ok()?;
     }
@@ -266,7 +278,7 @@ fn parse_update(payload: &str, now: Instant, address: SocketAddr) -> Option<Upda
         None
     };
     Some(Update { id: player, challenge, target, vehicle_claim, player: Player {
-        state, joined: now, seen: now, power, play_millis, address, modern: metadata.is_some(), shares_world, position, sample,
+        state, joined: now, seen: now, power, address, modern: metadata.is_some(), shares_world, position, sample,
         driving, vehicle_token, vehicle_model, owned_vehicle: driving.then_some((vehicle_token, vehicle_model)),
         vehicle_origin: None,
         seated, combat, result: CombatResult::default(),
@@ -325,7 +337,7 @@ fn apply_hit(player: &mut Player, kind: u8, damage: u32, impulse: [i16; 2], now:
 }
 
 fn simulate_hits(players: &mut HashMap<String, Player>, id: &str, target: &str,
-                 previous: Option<(Position, u64)>, now: Instant, log: &mut Option<fs::File>) {
+                 previous: Option<(Position, u64)>, now: Instant, log: &mut EventLog) {
     let attack = players.get(id).and_then(|player| player.combat);
     if let Some(input) = attack {
         let player = &mut players.get_mut(id).expect("sender exists");
@@ -340,7 +352,7 @@ fn simulate_hits(players: &mut HashMap<String, Player>, id: &str, target: &str,
                 if let Some(victim) = players.get_mut(target) {
                     if eligible(victim, now) && distance_squared(origin, victim.position) <= range.powi(2) {
                         apply_hit(victim, input.kind, if input.kind == 1 { 12 } else { 24 }, [0; 2], now);
-                        event(log, &format!("pvp_hit kind={} source={id} target={target}", input.kind));
+                        log.record(format!("pvp_hit kind={} source={id} target={target}", input.kind));
                     }
                 }
             }
@@ -361,23 +373,13 @@ fn simulate_hits(players: &mut HashMap<String, Player>, id: &str, target: &str,
         for (peer, (speed, impulse)) in hits {
             apply_hit(players.get_mut(&peer).expect("victim exists"), 3,
                 (speed * 2.0).round().clamp(10.0, 75.0) as u32, impulse, now);
-            event(log, &format!("pvp_hit kind=3 source={id} target={peer}"));
-        }
-    }
-}
-
-fn event(log: &mut Option<fs::File>, message: &str) {
-    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    println!("{timestamp} {message}");
-    if let Some(file) = log {
-        if let Err(error) = writeln!(file, "{timestamp} {message}") {
-            eprintln!("Could not write server log: {error}");
+            log.record(format!("pvp_hit kind=3 source={id} target={peer}"));
         }
     }
 }
 
 fn reply(socket: &UdpSocket, signer: &PacketMac, payload: &[u8], sender: SocketAddr,
-         outgoing: &mut [u8], log: &mut Option<fs::File>, counts: &mut status::Counters) {
+         outgoing: &mut [u8], log: &mut EventLog, counts: &mut status::Counters) {
     let size = SIGNATURE_LEN + payload.len();
     if size > outgoing.len() {
         return;
@@ -389,13 +391,13 @@ fn reply(socket: &UdpSocket, signer: &PacketMac, payload: &[u8], sender: SocketA
     match socket.send_to(&outgoing[..size], sender) {
         Ok(sent) => { counts.outgoing += 1; counts.bytes_out += sent as u64; }
         Err(error) if !matches!(error.kind(), io::ErrorKind::Interrupted | io::ErrorKind::ConnectionReset) =>
-            event(log, &format!("send_error {sender} {error}")),
+            log.record(format!("send_error {sender} {error}")),
         Err(_) => {}
     }
 }
 
-fn serve(socket: UdpSocket, signer: PacketMac, mut log: Option<fs::File>) -> io::Result<()> {
-    socket.set_read_timeout(Some(Duration::from_millis(500)))?;
+fn serve(socket: UdpSocket, signer: PacketMac, mut log: EventLog) -> io::Result<()> {
+    socket.set_read_timeout(Some(Duration::from_millis(250)))?;
     let mut players = HashMap::<String, Player>::with_capacity(MAX_PLAYERS);
     let mut departed = HashMap::<String, (SocketAddr, u64, Instant)>::new();
     let mut incoming = [0u8; 65_536];
@@ -403,14 +405,14 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: Option<fs::File>) -> io:
     let mut snapshot = String::with_capacity(PACKET_LIMIT - SIGNATURE_LEN);
     let mut region_owners = HashMap::<Sector, String>::new();
     let mut world = world::World::default();
-    let mut status = status::Status::new();
+    let mut status = status::Status::new(socket.local_addr()?);
     loop {
         let now = Instant::now();
         departed.retain(|_, (_, _, left)| now.duration_since(*left) < PLAYER_TIMEOUT);
         players.retain(|id, player| {
             let alive = now.duration_since(player.seen) < PLAYER_TIMEOUT;
             if !alive {
-                event(&mut log, &format!("disconnect player={id} ip={} reason=timeout play_seconds={}", player.address.ip(), player.play_millis / 1000));
+                log.record(format!("disconnect player={id} ip={} reason=timeout session_seconds={}", player.address.ip(), player.session_seconds(now)));
                 world.remove(id);
             }
             alive
@@ -464,8 +466,8 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: Option<fs::File>) -> io:
                         world.remove(id);
                         region_owners.retain(|_, owner| owner.as_str() != id);
                         world.reconcile(&players, Instant::now());
-                        event(&mut log, &format!("disconnect player={id} ip={} reason=client play_seconds={} online={}/{}",
-                            sender.ip(), player.play_millis / 1000, players.len(), MAX_PLAYERS));
+                        log.record(format!("disconnect player={id} ip={} reason=client session_seconds={} online={}/{}",
+                            sender.ip(), player.session_seconds(now), players.len(), MAX_PLAYERS));
                     }
                 }
             }
@@ -496,9 +498,6 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: Option<fs::File>) -> io:
                 continue;
             }
             fresh = update.sample > previous.sample || !update.modern && !previous.modern;
-            let advance = now.duration_since(previous.seen).as_millis().min(3000) as u32 + 75;
-            update.play_millis = update.play_millis.max(previous.play_millis)
-                .min(previous.play_millis.saturating_add(advance));
             if update.owned_vehicle.is_none() || update.owned_vehicle == previous.owned_vehicle {
                 update.vehicle_origin = previous.vehicle_origin.clone();
             }
@@ -534,7 +533,7 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: Option<fs::File>) -> io:
             } else {
                 departed.remove(id);
                 players.insert(id.to_owned(), update);
-                event(&mut log, &format!("connect player={id} ip={} online={}/{}",
+                log.record(format!("connect player={id} ip={} online={}/{}",
                     sender.ip(), players.len(), MAX_PLAYERS));
             }
             simulate_hits(&mut players, id, target, previous, now, &mut log);
@@ -610,11 +609,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let signer = PacketMac::new_from_slice(key.as_bytes()).map_err(|_| "Invalid signing key")?;
     let socket = UdpSocket::bind((bind, port))?;
-    let mut log = env::var_os("LF_LOG_FILE")
-        .map(|path| fs::OpenOptions::new().create(true).append(true).open(path))
-        .transpose()?;
-    event(&mut log, &format!("Liberty Friends {VERSION} listening on {bind}:{port}/UDP"));
-    event(&mut log, "world_sync protocol=LFW1 source=GTA_IV");
+    let file = env::var_os("LF_LOG_FILE").unwrap_or_else(|| "server.log".into());
+    let mut log = EventLog::new(fs::OpenOptions::new().create(true).append(true).open(file)?);
+    log.record(format!("LibertyMultiplayer {VERSION} listening on {bind}:{port}/UDP"));
+    log.record("world_sync protocol=LFW1 source=GTA_IV".into());
     serve(socket, signer, log)?;
     Ok(())
 }

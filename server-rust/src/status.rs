@@ -1,8 +1,35 @@
-use crate::{event, world::World, Player, MAX_PLAYERS};
-use std::collections::HashMap;
+use crate::{world::{priority, World}, Player, MAX_PLAYERS, VERSION};
+use std::collections::{HashMap, VecDeque};
+use std::fmt::Write as _;
 use std::fs;
+use std::io::{self, IsTerminal, Write};
+use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+pub struct EventLog {
+    file: fs::File,
+    recent: VecDeque<String>,
+    failed: bool,
+}
+
+impl EventLog {
+    pub fn new(file: fs::File) -> Self {
+        Self { file, recent: VecDeque::with_capacity(5), failed: false }
+    }
+
+    pub fn record(&mut self, message: String) {
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        if let Err(error) = writeln!(self.file, "{timestamp} {message}") {
+            if !self.failed { eprintln!("Could not write server log: {error}"); }
+            self.failed = true;
+        } else {
+            self.failed = false;
+        }
+        if self.recent.len() == 5 { self.recent.pop_front(); }
+        self.recent.push_back(message);
+    }
+}
 
 #[derive(Default)]
 pub struct Counters {
@@ -22,28 +49,37 @@ pub struct Status {
     cpu: Option<u64>,
     path: Option<PathBuf>,
     failed: bool,
+    screen: bool,
+    address: SocketAddr,
     pub counters: Counters,
 }
 
 impl Status {
-    pub fn new() -> Self {
+    pub fn new(address: SocketAddr) -> Self {
+        let screen = match std::env::var("LF_SCREEN").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            _ => io::stdout().is_terminal() &&
+                std::env::var("TERM").as_deref() != Ok("dumb"),
+        };
+        if !screen { println!("LibertyMultiplayer {VERSION} listening on {address}/UDP"); }
         Self {
             started: Instant::now(), cpu: process_runtime_ns(),
             path: std::env::var_os("LF_STATUS_FILE").filter(|p| !p.is_empty()).map(PathBuf::from),
-            failed: false, counters: Counters::default(),
+            failed: false, screen, address, counters: Counters::default(),
         }
     }
 
     pub fn report(&mut self, now: Instant, players: &HashMap<String, Player>, world: &mut World,
-                  log: &mut Option<fs::File>) {
+                  log: &mut EventLog) {
         for line in world.events() {
-            event(log, &line);
+            log.record(line);
         }
         let elapsed = now.duration_since(self.started);
         if elapsed < Duration::from_secs(1) { return; }
         world.reconcile(players, now);
         for line in world.events() {
-            event(log, &line);
+            log.record(line);
         }
         let counts = std::mem::take(&mut self.counters);
         let seconds = elapsed.as_secs_f64();
@@ -55,28 +91,64 @@ impl Status {
         let load = fs::read_to_string("/proc/loadavg").ok().and_then(|value| value.split_whitespace().next()?.parse::<f64>().ok());
         let rate = |count| (count as f64 / seconds).round() as u64;
         let (hosts, vehicles, sources, transfers) = world.status();
-        let cpu_label = percent.map_or_else(|| "-".into(), |value| format!("{value:.1}%"));
-        let memory_label = rss.map_or_else(|| "-".into(), |value| format!("{:.1}MiB", value as f64 / 1024.0));
-        println!("status online={}/{} hosts={} sources={sources} vehicles={vehicles} transfers={transfers} cpu={cpu_label} rss={memory_label} udp_rx={}/s udp_tx={}/s bytes_rx={}/s bytes_tx={}/s updates={}/s invalid={} stale={} claims_denied={} version_mismatches={}",
-            players.len(), MAX_PLAYERS, if hosts.is_empty() { "-" } else { &hosts },
-            rate(counts.incoming), rate(counts.outgoing), rate(counts.bytes_in), rate(counts.bytes_out),
-            rate(counts.updates), counts.invalid, counts.stale, counts.claims_denied, counts.version_mismatches);
         if counts.invalid + counts.claims_denied + counts.version_mismatches != 0 {
-            event(log, &format!("udp_rejections window_ms={} invalid={} vehicle_claims={} version_mismatches={}",
+            log.record(format!("udp_rejections window_ms={} invalid={} vehicle_claims={} version_mismatches={}",
                 elapsed.as_millis(), counts.invalid, counts.claims_denied, counts.version_mismatches));
+        }
+        let mut ordered: Vec<_> = players.iter().collect();
+        ordered.sort_unstable_by_key(|(id, player)| (world.role(id).1 != "host", player.joined, id.as_str()));
+        let rows = ordered.into_iter().map(|(id, player)| {
+            let (episode, role) = world.role(id);
+            let seconds = player.session_seconds(now);
+            (id, player.address.ip(), seconds, player.power, priority(player.power, seconds), episode, role)
+        }).collect::<Vec<_>>();
+        if self.screen {
+            let cpu_label = percent.map_or_else(|| "-".into(), |value| {
+                let fill = ((value / 5.0).round() as usize).min(20);
+                format!("[{}{}] {value:.1}%", "#".repeat(fill), ".".repeat(20 - fill))
+            });
+            let memory_label = rss.map_or_else(|| "-".into(), |value| format!("{:.1} MiB", value as f64 / 1024.0));
+            let load_label = load.map_or_else(|| "-".into(), |value| format!("{value:.2}"));
+            let mut screen = format!("\x1b[H\x1b[J\x1b[1;36m LibertyMultiplayer {VERSION}   {} / UDP\x1b[0m\n\n CPU  {cpu_label}   RSS {memory_label}   Load {load_label}\n",
+                self.address);
+            writeln!(screen, " UDP  RX {} pkt/s ({:.1} KiB/s)   TX {} pkt/s ({:.1} KiB/s)",
+                rate(counts.incoming), rate(counts.bytes_in) as f64 / 1024.0,
+                rate(counts.outgoing), rate(counts.bytes_out) as f64 / 1024.0).unwrap();
+            writeln!(screen, "      {} updates/s   {} invalid   {} stale   {} denied\n",
+                rate(counts.updates), counts.invalid, counts.stale, counts.claims_denied).unwrap();
+            writeln!(screen, " Players {}/{}   Vehicles {vehicles}   Transfers {transfers}", players.len(), MAX_PLAYERS).unwrap();
+            writeln!(screen, " ID                IP               Session   Power  Score   Ep   Role").unwrap();
+            for &(id, ip, seconds, power, score, episode, role) in &rows {
+                if role == "host" { screen.push_str("\x1b[1;32m"); }
+                writeln!(screen, " {id:16}  {:15}  {:02}:{:02}:{:02}   0.{power:02}  {score:6}   {:<2}   {role}\x1b[0m",
+                    ip.to_string(), seconds / 3600, seconds / 60 % 60, seconds % 60,
+                    episode.map_or_else(|| "-".into(), |e| e.to_string())).unwrap();
+            }
+            writeln!(screen, "\n Recent events").unwrap();
+            for line in &log.recent {
+                writeln!(screen, " {:.76}", line).unwrap();
+            }
+            screen.push_str("\n Ctrl+C exits\n");
+            let mut stdout = io::stdout().lock();
+            if stdout.write_all(screen.as_bytes()).and_then(|_| stdout.flush()).is_err() {
+                self.screen = false;
+            }
         }
         if let Some(path) = &self.path {
             let mut temporary = path.as_os_str().to_owned();
             temporary.push(".tmp");
             let optional_float = |value: Option<f64>| value.map_or_else(|| "null".into(), |n| format!("{n:.2}"));
+            let members = rows.iter().map(|(id, ip, seconds, power, score, episode, role)| format!(
+                "{{\"id\":\"{id}\",\"ip\":\"{ip}\",\"session_seconds\":{seconds},\"power\":{power},\"score\":{score},\"episode\":{},\"role\":\"{role}\"}}",
+                episode.map_or_else(|| "null".into(), |e| e.to_string()))).collect::<Vec<_>>().join(",");
             let json = format!(
-                "{{\"online\":{},\"capacity\":{},\"hosts\":\"{hosts}\",\"sources\":{sources},\"vehicles\":{vehicles},\"transfers\":{transfers},\"cpu_percent\":{},\"rss_kib\":{},\"system_load_1m\":{},\"rx_packets_s\":{},\"tx_packets_s\":{},\"rx_bytes_s\":{},\"tx_bytes_s\":{},\"accepted_updates_s\":{},\"invalid_packets\":{},\"stale_updates\":{},\"claims_denied\":{},\"version_mismatches\":{}}}\n",
+                "{{\"online\":{},\"capacity\":{},\"hosts\":\"{hosts}\",\"players\":[{members}],\"sources\":{sources},\"vehicles\":{vehicles},\"transfers\":{transfers},\"cpu_percent\":{},\"rss_kib\":{},\"system_load_1m\":{},\"rx_packets_s\":{},\"tx_packets_s\":{},\"rx_bytes_s\":{},\"tx_bytes_s\":{},\"accepted_updates_s\":{},\"invalid_packets\":{},\"stale_updates\":{},\"claims_denied\":{},\"version_mismatches\":{}}}\n",
                 players.len(), MAX_PLAYERS, optional_float(percent), rss.map_or_else(|| "null".into(), |n| n.to_string()),
                 optional_float(load), rate(counts.incoming), rate(counts.outgoing), rate(counts.bytes_in),
                 rate(counts.bytes_out), rate(counts.updates), counts.invalid, counts.stale, counts.claims_denied, counts.version_mismatches);
             let result = fs::write(&temporary, json).and_then(|_| fs::rename(&temporary, path));
             if let Err(error) = &result {
-                if !self.failed { event(log, &format!("status_write_error path={} error={error}", path.display())); }
+                if !self.failed { log.record(format!("status_write_error path={} error={error}", path.display())); }
             }
             self.failed = result.is_err();
         }

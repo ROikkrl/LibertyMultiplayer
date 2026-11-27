@@ -17,7 +17,7 @@ PACKET_LIMIT = 1200
 PLAYER_ID = re.compile(rb"[0-9a-f]{16}")
 RIDE_ID = re.compile(rb"(?:-|[0-9a-f]{16}:-?[0-9]{1,10})")
 WORLD_ENTITY = re.compile(rb"(?:p(?:,-?[0-9]{1,11}){6}|v(?:,-?[0-9]{1,11}){6}(?:,-?[0-9]{1,4}){0,4})")
-STATE_META = re.compile(rb"~([0-9]{1,12}),([0-9]{1,12}),([01]),([0-9]{1,3}),(-1|[0-9]{1,3}),(-|[A-Za-z0-9_]{1,32})(?:,(-?[0-9]{1,4}),([0-9]{1,10}),([0-4]))?")
+STATE_META = re.compile(rb"~([0-9]{1,12}),([0-9]{1,12}),([01]),([0-9]{1,3}),(-1|[0-9]{1,3}),(-|[A-Za-z0-9_]{1,32})(?:,(-?[0-9]{1,4}),([0-9]{1,10}),([0-4])(?:,(-?[0-9]{1,5}),(-?[0-9]{1,5}),(-?[0-9]{1,4}))?)?")
 COMBAT_META = re.compile(rb"!([0-7]),([0-9]{1,19}),([0-2]),(-|[0-9a-f]{16})")
 WORLD_PAGE_ROWS = 5
 WORLD_MAX_PAGES = 6
@@ -61,7 +61,9 @@ def coordinates(fields):
         metadata_field = fields[-1]
         match = STATE_META.fullmatch(fields[-1])
         if (not match or not -1 <= int(match[5]) <= 255 or int(match[4]) > 511 or
-                (match[7] is not None and (abs(int(match[7])) > 1000 or int(match[8]) > 0xFFFFFFFF))):
+                (match[7] is not None and (abs(int(match[7])) > 1000 or int(match[8]) > 0xFFFFFFFF)) or
+                (match[10] is not None and any(abs(int(match[i])) > maximum
+                                              for i, maximum in ((10, 15000), (11, 15000), (12, 6000))))):
             raise ValueError("invalid state metadata")
         metadata = b" " + fields[-1]
         fields = fields[:-1]
@@ -214,10 +216,10 @@ def serve(args):
                 if not fields or fields[0] != WIRE_VERSION:
                     sock.sendto(seal(args.key, b" ".join((b"LF-VERSION", challenge, WIRE_VERSION))), address)
                     continue
-                if (len(fields) < 4 or not fields[1].isdigit() or not 1 <= int(fields[1]) <= 99 or
-                        not fields[2].isdigit() or (fields[3] != b"-" and not TRAFFIC_KEY.fullmatch(fields[3]))):
+                if (len(fields) < 3 or not fields[1].isdigit() or not 1 <= int(fields[1]) <= 99 or
+                        (fields[2] != b"-" and not TRAFFIC_KEY.fullmatch(fields[2]))):
                     continue
-                fields = fields[4:]
+                fields = fields[3:]
                 position = coordinates(fields).split(b" !", 1)[0]
             except ValueError:
                 continue
@@ -383,13 +385,17 @@ class PeerExchange:
             sock.send(seal(self.key, payload))
 
     def send(self, sock, position, now):
-        tick, play, vehicle, *fields = position.split()
+        columns = position.split()
+        if len(columns) == 4:
+            tick, *fields = columns
+            vehicle = b"-"
+        else:
+            tick, vehicle, *fields = columns
         sample = int(tick)
-        if sample <= self.last_sample or not play.isdigit() or (
-                vehicle != b"-" and not TRAFFIC_KEY.fullmatch(vehicle)):
+        if sample <= self.last_sample or (vehicle != b"-" and not TRAFFIC_KEY.fullmatch(vehicle)):
             return
         challenge = secrets.token_hex(8).encode("ascii")
-        payload = b" ".join((b"LF1", self.player_id, challenge, WIRE_VERSION, self.power, play, vehicle,
+        payload = b" ".join((b"LF1", self.player_id, challenge, WIRE_VERSION, self.power, vehicle,
                              coordinates(fields)))
         self.pending = {token: item for token, item in self.pending.items() if now - item[0] < REPLY_WINDOW}
         sock.send(seal(self.key, payload))
@@ -496,7 +502,7 @@ def join(args, stop=None, report=print):
                         last_position, last_change = position, started
                 else:
                     position = last_position or b""
-                if position == b"PAUSED " + player_id + b"\n":
+                if position.startswith(b"PAUSED ") and position.rstrip(b"\r\n") == b"PAUSED " + player_id:
                     next_status = "Paused in GTA IV"
                     if status != next_status:
                         peer.pause()
@@ -511,7 +517,7 @@ def join(args, stop=None, report=print):
                     leave_retries = 0
                     next_status = "Waiting for the server"
                     sample = int(position.partition(b" ")[0])
-                    if sample + 500 < peer.last_sample:
+                    if status == "Paused in GTA IV" or sample + 500 < peer.last_sample:
                         peer.leave(sock)
                         player_id = secrets.token_hex(8).encode("ascii")
                         (directory / "player.txt").write_bytes(player_id)
