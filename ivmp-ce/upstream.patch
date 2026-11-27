@@ -1,0 +1,245 @@
+diff --git a/Client/Core/COffsets.cpp b/Client/Core/COffsets.cpp
+index 9dc6716..1145181 100644
+--- a/Client/Core/COffsets.cpp
++++ b/Client/Core/COffsets.cpp
+@@ -9,6 +9,7 @@
+ //==============================================================================
+ 
+ #include "COffsets.h"
++#include "CompleteEdition/CEBindings.h"
+ 
+ eGameVersion COffsets::m_GameVersion = GAME_VERSION_UNKNOWN;
+ 
+@@ -224,6 +225,23 @@ unsigned int COffsets::FUNC_CPedWeapons__RemoveAllWeapons = 0;
+ void COffsets::Init(unsigned int uiBase)
+ {
+ 	m_GameVersion = GAME_VERSION_UNKNOWN;
++	const auto module = GetModuleHandleW(nullptr);
++	const auto image = reinterpret_cast<const std::uint8_t*>(module);
++	if (ivmp_ce::IsCompleteEditionBuild(ivmp_ce::PeHeader(image)))
++	{
++		const auto engine = ivmp_ce::ResolveLoadedModule(module);
++		if (engine)
++		{
++			m_GameVersion = GAME_VERSION_CE_12059;
++			FUNC_ScrVM__FindNativeAddress = static_cast<unsigned int>(engine.Address(ivmp_ce::Binding::FindNative));
++			FUNC_GetRunningScriptThread = static_cast<unsigned int>(engine.Address(ivmp_ce::Binding::ActiveScriptThread));
++			FUNC_CPhysical__GetMoveSpeed = static_cast<unsigned int>(engine.Address(ivmp_ce::Binding::GetMoveSpeed));
++			FUNC_CPhysical__SetMoveSpeed = static_cast<unsigned int>(engine.Address(ivmp_ce::Binding::SetMoveSpeed));
++			FUNC_CPhysical__GetTurnSpeed = static_cast<unsigned int>(engine.Address(ivmp_ce::Binding::GetTurnSpeed));
++			FUNC_CPhysical__SetTurnSpeed = static_cast<unsigned int>(engine.Address(ivmp_ce::Binding::SetTurnSpeed));
++		}
++		return;
++	}
+ 	unsigned int * uiTestAddr = (unsigned int *)(uiBase + 0x608C34);
+ 
+ 	switch(*uiTestAddr)
+diff --git a/Client/Core/COffsets.h b/Client/Core/COffsets.h
+index 846101b..fe23e94 100644
+--- a/Client/Core/COffsets.h
++++ b/Client/Core/COffsets.h
+@@ -20,6 +20,7 @@ enum eGameVersion
+ 	GAME_VERSION_5,       // 1.0.0.4
+ 	GAME_VERSION_6,       // 1.0.6.0
+ 	GAME_VERSION_7,       // 1.0.7.0
++	GAME_VERSION_CE_12059, // Steam Complete Edition, bindings under development
+ };
+ 
+ class COffsets
+diff --git a/Client/Core/Client.Core.vcxproj b/Client/Core/Client.Core.vcxproj
+index 775d25e..2d8a791 100644
+--- a/Client/Core/Client.Core.vcxproj
++++ b/Client/Core/Client.Core.vcxproj
+@@ -161,6 +161,8 @@
+     <ClInclude Include="CGameFileChecker.h" />
+     <ClInclude Include="CModelManager.h" />
+     <ClInclude Include="COffsets.h" />
++    <ClInclude Include="CompleteEdition\CEProfile.h" />
++    <ClInclude Include="CompleteEdition\CEBindings.h" />
+     <ClInclude Include="CPools.h" />
+     <ClInclude Include="Indicators.h" />
+     <ClInclude Include="IV\CIVCam.h" />
+diff --git a/Client/Core/IV/CIVPhysical.cpp b/Client/Core/IV/CIVPhysical.cpp
+index 31c8920..68ec6ee 100644
+--- a/Client/Core/IV/CIVPhysical.cpp
++++ b/Client/Core/IV/CIVPhysical.cpp
+@@ -11,6 +11,7 @@
+ #include "../CGame.h"
+ #include <CLogFile.h>
+ #include "../COffsets.h"
++#include "../CompleteEdition/CEBindings.h"
+ 
+ CIVPhysical::CIVPhysical() : CIVDynamicEntity()
+ {
+@@ -43,6 +44,12 @@ void CIVPhysical::SetMoveSpeed(const CVector3& vecMoveSpeed)
+ 
+ 	if(pPhysical)
+ 	{
++		if (COffsets::GetVersion() == GAME_VERSION_CE_12059)
++		{
++			const ivmp_ce::Engine engine{ reinterpret_cast<const std::uint8_t*>(GetModuleHandleW(nullptr)) };
++			engine.WriteSpeed(pPhysical, ivmp_ce::Binding::SetMoveSpeed, vecMoveSpeed.fX, vecMoveSpeed.fY, vecMoveSpeed.fZ);
++			return;
++		}
+ 		const CVector3 * pVecMoveSpeed = &vecMoveSpeed;
+ 		_asm
+ 		{
+@@ -59,6 +66,12 @@ void CIVPhysical::GetMoveSpeed(CVector3& vecMoveSpeed)
+ 
+ 	if(pPhysical)
+ 	{
++		if (COffsets::GetVersion() == GAME_VERSION_CE_12059)
++		{
++			const ivmp_ce::Engine engine{ reinterpret_cast<const std::uint8_t*>(GetModuleHandleW(nullptr)) };
++			engine.ReadSpeed(pPhysical, ivmp_ce::Binding::GetMoveSpeed, vecMoveSpeed.fX, vecMoveSpeed.fY, vecMoveSpeed.fZ);
++			return;
++		}
+ 		CVector3 * pVecMoveSpeed = &vecMoveSpeed;
+ 		_asm
+ 		{
+@@ -75,6 +88,12 @@ void CIVPhysical::SetTurnSpeed(const CVector3& vecTurnSpeed)
+ 
+ 	if(pPhysical)
+ 	{
++		if (COffsets::GetVersion() == GAME_VERSION_CE_12059)
++		{
++			const ivmp_ce::Engine engine{ reinterpret_cast<const std::uint8_t*>(GetModuleHandleW(nullptr)) };
++			engine.WriteSpeed(pPhysical, ivmp_ce::Binding::SetTurnSpeed, vecTurnSpeed.fX, vecTurnSpeed.fY, vecTurnSpeed.fZ);
++			return;
++		}
+ 		const CVector3 * pVecTurnSpeed = &vecTurnSpeed;
+ 		_asm
+ 		{
+@@ -91,6 +110,12 @@ void CIVPhysical::GetTurnSpeed(CVector3& vecTurnSpeed)
+ 
+ 	if(pPhysical)
+ 	{
++		if (COffsets::GetVersion() == GAME_VERSION_CE_12059)
++		{
++			const ivmp_ce::Engine engine{ reinterpret_cast<const std::uint8_t*>(GetModuleHandleW(nullptr)) };
++			engine.ReadSpeed(pPhysical, ivmp_ce::Binding::GetTurnSpeed, vecTurnSpeed.fX, vecTurnSpeed.fY, vecTurnSpeed.fZ);
++			return;
++		}
+ 		CVector3 * pVecTurnSpeed = &vecTurnSpeed;
+ 		_asm
+ 		{
+diff --git a/Client/Core/IVCommon.h b/Client/Core/IVCommon.h
+index 1170246..e6e0585 100644
+--- a/Client/Core/IVCommon.h
++++ b/Client/Core/IVCommon.h
+@@ -12,7 +12,7 @@
+ 
+ #include <Common.h>
+ 
+-#define PAD(prefix, name, size) BYTE prefix##_##name##[size]
++#define PAD(prefix, name, size) BYTE prefix##_##name[size]
+ 
+ template <typename T>
+ struct CSimpleCollection
+diff --git a/Client/Core/Main.cpp b/Client/Core/Main.cpp
+index eca31da..681912f 100644
+--- a/Client/Core/Main.cpp
++++ b/Client/Core/Main.cpp
+@@ -10,6 +10,8 @@
+ #include <windows.h>
+ #include <Common.h>
+ #include "CClient.h"
++#include "COffsets.h"
++#include "CompleteEdition/CEBindings.h"
+ 
+ CClient * g_pClient = NULL;
+ 
+@@ -22,6 +24,24 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
+ 			// Disable thread library notifications
+ 			DisableThreadLibraryCalls(hModule);
+ 
++			const auto game = GetModuleHandleW(nullptr);
++			const auto image = reinterpret_cast<const std::uint8_t*>(game);
++			const auto header = ivmp_ce::PeHeader(image);
++			if (ivmp_ce::IsCompleteEditionBuild(header))
++			{
++				COffsets::Init(static_cast<unsigned int>(reinterpret_cast<std::uintptr_t>(game) - 0x400000));
++				if (COffsets::GetVersion() != GAME_VERSION_CE_12059)
++				{
++					OutputDebugStringW(L"IV:MP CE: GTAIV.exe failed binding validation.\n");
++					return FALSE;
++				}
++				// Leave the scheduler and game pools alone until their CE-specific client paths exist.
++				OutputDebugStringW(L"IV:MP CE: engine bindings resolved; multiplayer bootstrap is pending.\n");
++				return TRUE;
++			}
++
++			if (!ivmp_ce::IsLegacyHookLayout(image, header)) return FALSE;
++
+ 			// Create the client instance
+ 			g_pClient = new CClient();
+ 
+@@ -37,7 +57,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
+ 	case DLL_PROCESS_DETACH:
+ 		{
+ 			// Call the client OnUnload function
+-			g_pClient->OnUnload();
++			if (g_pClient) g_pClient->OnUnload();
+ 
+ 			// Delete the client instance
+ 			SAFE_DELETE(g_pClient);
+diff --git a/Client/Core/NativeContext.h b/Client/Core/NativeContext.h
+index 0850e3a..a30a3a8 100644
+--- a/Client/Core/NativeContext.h
++++ b/Client/Core/NativeContext.h
+@@ -10,6 +10,7 @@
+ #pragma once
+ 
+ #include "IVCommon.h"
++#include <cstring>
+ 
+ class IVNativeCallContext
+ {
+@@ -44,6 +45,7 @@ public:
+ 		m_pReturn = &m_TempStack;
+ 		m_nArgCount = 0;
+ 		m_nDataCount = 0;
++		std::memset(m_TempStack, 0, sizeof(m_TempStack));
+ 	}
+ 
+ 	template <typename T>
+diff --git a/Client/Core/NativeInvoke.h b/Client/Core/NativeInvoke.h
+index b3aea70..28b77be 100644
+--- a/Client/Core/NativeInvoke.h
++++ b/Client/Core/NativeInvoke.h
+@@ -15,6 +15,7 @@
+ #include "CGame.h"
+ #include <CLogFile.h>
+ #include "COffsets.h"
++#include "CompleteEdition/CEBindings.h"
+ 
+ // Log native calls(detect crash scripting functions)
+ //#define NATIVE_LOG 1
+@@ -28,7 +29,12 @@ private:
+ 	{
+ 		DWORD dwFunc = COffsets::FUNC_ScrVM__FindNativeAddress;
+ 		DWORD dwNativeFunc = NULL;
+-		_asm
++		if (COffsets::GetVersion() == GAME_VERSION_CE_12059)
++		{
++			const auto lookup = reinterpret_cast<ivmp_ce::Engine::Lookup>(dwFunc);
++			if (lookup) dwNativeFunc = reinterpret_cast<DWORD>(lookup(uiHash));
++		}
++		else _asm
+ 		{
+ 			push esi
+ 			mov esi, uiHash
+diff --git a/Shared/CEvents.h b/Shared/CEvents.h
+index 6e9026a..61086d7 100644
+--- a/Shared/CEvents.h
++++ b/Shared/CEvents.h
+@@ -232,7 +232,8 @@ public:
+ 	CSquirrelArgument Call(String strName, CSquirrel* pScript = NULL)
+ 	{
+ 		CSquirrelArgument pReturn((int)1);
+-		Call(strName, &CSquirrelArguments(), &pReturn, pScript);
++		CSquirrelArguments empty;
++		Call(strName, &empty, &pReturn, pScript);
+ 		return pReturn;
+ 	}
+ 
