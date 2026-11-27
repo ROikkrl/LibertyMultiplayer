@@ -15,7 +15,7 @@ type PacketMac = Hmac<Sha256>;
 const MAX_PLAYERS: usize = 4;
 const PACKET_LIMIT: usize = 1200;
 const SIGNATURE_LEN: usize = 32;
-const PLAYER_TIMEOUT: Duration = Duration::from_secs(3);
+const PLAYER_TIMEOUT: Duration = Duration::from_secs(8);
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 type Position = [f64; 3];
@@ -391,6 +391,7 @@ fn reply(socket: &UdpSocket, signer: &PacketMac, payload: &[u8], sender: SocketA
 fn serve(socket: UdpSocket, signer: PacketMac, mut log: Option<fs::File>) -> io::Result<()> {
     socket.set_read_timeout(Some(Duration::from_millis(500)))?;
     let mut players = HashMap::<String, Player>::with_capacity(MAX_PLAYERS);
+    let mut departed = HashMap::<String, (SocketAddr, u64, Instant)>::new();
     let mut incoming = [0u8; 65_536];
     let mut outgoing = [0u8; PACKET_LIMIT];
     let mut snapshot = String::with_capacity(PACKET_LIMIT - SIGNATURE_LEN);
@@ -398,6 +399,7 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: Option<fs::File>) -> io:
     let mut world = world::World::default();
     loop {
         let now = Instant::now();
+        departed.retain(|_, (_, _, left)| now.duration_since(*left) < PLAYER_TIMEOUT);
         players.retain(|id, player| {
             let alive = now.duration_since(player.seen) < PLAYER_TIMEOUT;
             if !alive {
@@ -437,17 +439,26 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: Option<fs::File>) -> io:
                 }
             }
         }
-        if let Some(id) = payload.strip_prefix("LF-LEAVE ") {
-            if players.get(id).map_or(false, |player| player.address == sender) {
-                players.remove(id);
-                world.remove(id);
-                region_owners.retain(|_, owner| owner.as_str() != id);
-                event(&mut log, &format!("disconnect player={id} reason=client"));
+        if let Some(leave) = payload.strip_prefix("LF-LEAVE ") {
+            let mut fields = leave.split_ascii_whitespace();
+            if let (Some(id), Some(sample)) = (fields.next(), fields.next().and_then(|value| value.parse::<u64>().ok())) {
+                if fields.next().is_none() && valid_id(id) &&
+                    players.get(id).map_or(true, |player| player.address == sender && player.sample <= sample) &&
+                    departed.get(id).map_or(true, |(address, previous, _)| *address == sender && *previous <= sample) &&
+                    (departed.contains_key(id) || departed.len() < 256)
+                {
+                    departed.insert(id.to_owned(), (sender, sample, Instant::now()));
+                    if players.remove(id).is_some() {
+                        world.remove(id);
+                        region_owners.retain(|_, owner| owner.as_str() != id);
+                        event(&mut log, &format!("disconnect player={id} reason=client"));
+                    }
+                }
             }
             continue;
         }
         let now = Instant::now();
-        if payload.starts_with("LFWQ ") || payload.starts_with("LFWU ") || payload.starts_with("LFWT ") {
+        if ["LFWQ ", "LFWU ", "LFWT ", "LFWR "].iter().any(|prefix| payload.starts_with(prefix)) {
             if let Some(pages) = world.handle(payload, sender, &players, now) {
                 for page in pages {
                     reply(&socket, &signer, page.as_bytes(), sender, &mut outgoing, &mut log);
@@ -462,10 +473,15 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: Option<fs::File>) -> io:
         if !players.contains_key(id) && players.len() >= MAX_PLAYERS {
             continue;
         }
+        if departed.get(id).map_or(false, |(address, sample, _)| *address != sender || update.sample <= *sample) {
+            continue;
+        }
+        let mut fresh = true;
         if let Some(previous) = players.get(id) {
             if previous.address != sender {
                 continue;
             }
+            fresh = update.sample > previous.sample || !update.modern && !previous.modern;
             let advance = now.duration_since(previous.seen).as_millis().min(3000) as u32 + 75;
             update.play_millis = update.play_millis.max(previous.play_millis)
                 .min(previous.play_millis.saturating_add(advance));
@@ -473,33 +489,41 @@ fn serve(socket: UdpSocket, signer: PacketMac, mut log: Option<fs::File>) -> io:
                 update.vehicle_origin = previous.vehicle_origin.clone();
             }
         }
-        if update.driving && vehicle_claim != "-" {
+        if fresh && update.driving && vehicle_claim != "-" {
             if !world.commit_driving(id, vehicle_claim, &update, now) {
-                continue;
+                // Keep the accepted pose when a vehicle transfer was denied or expired.
+                if let Some(player) = players.get_mut(id) {
+                    player.seen = now;
+                    fresh = false;
+                } else {
+                    continue;
+                }
+            } else {
+                update.vehicle_origin = Some(vehicle_claim.to_owned());
             }
-            update.vehicle_origin = Some(vehicle_claim.to_owned());
         }
 
-        let modern = update.modern;
-        let modern_combat = update.combat.is_some();
-        let region = sector(update.position);
-        let mut previous = None;
-        if let Some(player) = players.get_mut(id) {
-            if player.driving && update.driving && player.vehicle_token == update.vehicle_token {
-                previous = Some((player.position, player.sample));
+        if fresh {
+            let mut previous = None;
+            if let Some(player) = players.get_mut(id) {
+                if player.driving && update.driving && player.vehicle_token == update.vehicle_token {
+                    previous = Some((player.position, player.sample));
+                }
+                let result = std::mem::take(&mut player.result);
+                *player = Player { result, joined: player.joined, power: player.power,
+                    owned_vehicle: update.owned_vehicle.or(player.owned_vehicle), ..update };
+            } else {
+                departed.remove(id);
+                players.insert(id.to_owned(), update);
+                event(&mut log, &format!("connect player={id} ip={} online={}/{}",
+                    sender.ip(), players.len(), MAX_PLAYERS));
             }
-            let result = std::mem::take(&mut player.result);
-            *player = Player { result, joined: player.joined, power: player.power,
-                owned_vehicle: update.owned_vehicle.or(player.owned_vehicle), ..update };
-        } else if players.len() < MAX_PLAYERS {
-            players.insert(id.to_owned(), update);
-            event(&mut log, &format!("connect player={id} ip={} online={}/{}",
-                sender.ip(), players.len(), MAX_PLAYERS));
-        } else {
-            continue;
+            simulate_hits(&mut players, id, target, previous, now, &mut log);
         }
-
-        simulate_hits(&mut players, id, target, previous, now, &mut log);
+        let local = &players[id];
+        let modern = local.modern;
+        let modern_combat = local.combat.is_some();
+        let region = sector(local.position);
         region_owners.retain(|region, owner| players.get(owner)
             .map_or(false, |peer| peer.shares_world && sector(peer.position) == *region));
         for (peer_id, peer) in &players {

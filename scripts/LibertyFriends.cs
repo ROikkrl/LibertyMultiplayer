@@ -104,13 +104,24 @@ public sealed class LibertyFriends : Script
             if (samples.Count > 12) samples.RemoveAt(0);
         }
 
-        public Pose Read(long time)
+        public Pose Read(long time, bool predictWalking = false)
         {
             while (samples.Count > 2 && samples[1].At <= time) samples.RemoveAt(0);
             Pose first = samples[0];
             if (samples.Count == 1 || time <= first.At) return first;
             Pose next = samples[1];
-            if (time >= next.At) return next;
+            if (time >= next.At)
+            {
+                long interval = next.Sample - first.Sample;
+                if (!predictWalking || interval < 15 || interval > 300) return next;
+                float dx = next.Position.X - first.Position.X;
+                float dy = next.Position.Y - first.Position.Y;
+                float maxDistance = interval * 0.010f;
+                if (dx * dx + dy * dy > maxDistance * maxDistance) return next;
+                float advance = (float)Math.Min(100, time - next.At) / interval;
+                return new Pose { Position = new Vector3(next.Position.X + dx * advance,
+                    next.Position.Y + dy * advance, next.Position.Z), Heading = next.Heading };
+            }
             float t = (float)(time - first.At) / Math.Max(1, next.At - first.At);
             return new Pose { Position = Lerp(first.Position, next.Position, t),
                 Heading = BlendHeading(first.Heading, next.Heading, t),
@@ -138,7 +149,6 @@ public sealed class LibertyFriends : Script
     private string lastSnapshot;
     private long lastUpdate;
     private long nextSample;
-    private long lastFrame;
     private long nextBridgeCheck;
     private string ownId = "";
     private string pausedSession;
@@ -181,6 +191,7 @@ public sealed class LibertyFriends : Script
     private readonly List<Ped> publishedPeds = new List<Ped>(2);
     private readonly List<Vehicle> publishedCars = new List<Vehicle>(2);
     private readonly Dictionary<string, AvatarGait> avatarGaits = new Dictionary<string, AvatarGait>();
+    private readonly Dictionary<string, PoseTrack> avatarTracks = new Dictionary<string, PoseTrack>();
     private static readonly VehicleWheel[] replicatedWheels = {
         VehicleWheel.FrontLeft, VehicleWheel.FrontRight, VehicleWheel.RearLeft, VehicleWheel.RearRight
     };
@@ -343,11 +354,8 @@ public sealed class LibertyFriends : Script
             if (!Player.CanControlCharacter || !Exists(Player.Character)) return;
             active = true;
             nextSample = now;
-            lastFrame = now;
             Trace("save ready; sending local state and waiting for server");
         }
-        float step = Math.Min(1f, (now - lastFrame) / 80f);
-        lastFrame = now;
         Ped character = Player.Character;
         if (!Exists(character))
         {
@@ -356,7 +364,7 @@ public sealed class LibertyFriends : Script
         }
         if (now < nextSample)
         {
-            MoveAvatars(step, now);
+            MoveAvatars(now);
             return;
         }
         nextSample = Math.Max(now + 1, nextSample + 33);
@@ -447,12 +455,12 @@ public sealed class LibertyFriends : Script
         {
             // The network client may be replacing the snapshot during this tick.
         }
-        if (serverConnected && now - lastUpdate > 2500)
+        if (serverConnected && now - lastUpdate > 5000)
         {
             ResetConnection();
             Trace("server timed out; remote entities removed");
         }
-        if (sharedSource != null && now - lastSharedAt > 3000)
+        if (sharedSource != null && now - lastSharedAt > 5000)
         {
             sharedSource = null;
             SetPopulationSuppressed(false);
@@ -460,7 +468,7 @@ public sealed class LibertyFriends : Script
             Trace("shared world timed out");
         }
         UpdateLocalPopulation(character, now);
-        MoveAvatars(step, now);
+        MoveAvatars(now);
     }
 
     private void CountActiveGame(long now)
@@ -567,6 +575,18 @@ public sealed class LibertyFriends : Script
             if (metadata.StartsWith("~", StringComparison.Ordinal)) ReadMetadata(peer, metadata);
             peers[columns[0]] = peer;
             UpdateAvatar(columns[0], position, character, peer.PedModel);
+            if (avatars.ContainsKey(columns[0]) && peer.CarId == null && peer.Ride == "-" &&
+                (peer.CombatFlags & 6) == 0)
+            {
+                PoseTrack walk;
+                if (!avatarTracks.TryGetValue(columns[0], out walk))
+                {
+                    walk = new PoseTrack();
+                    avatarTracks[columns[0]] = walk;
+                }
+                walk.Add(peer.Sample, clock.ElapsedMilliseconds, peer.Position, peer.Heading, null);
+            }
+            else avatarTracks.Remove(columns[0]);
             PrepareCombatAvatar(columns[0], peer);
             UpdateAvatarMotion(columns[0], peer);
             Blip marker;
@@ -597,6 +617,7 @@ public sealed class LibertyFriends : Script
                 if (Exists(avatars[id])) avatars[id].Delete();
                 avatars.Remove(id);
                 avatarGaits.Remove(id);
+                avatarTracks.Remove(id);
                 vulnerableAvatars.Remove(id);
                 avatarRagdolls.Remove(id);
             }
@@ -1533,6 +1554,7 @@ public sealed class LibertyFriends : Script
             if (Exists(avatar)) avatar.Delete();
             avatars.Remove(id);
             avatarGaits.Remove(id);
+            avatarTracks.Remove(id);
             vulnerableAvatars.Remove(id);
             avatarRagdolls.Remove(id);
             return;
@@ -1542,6 +1564,7 @@ public sealed class LibertyFriends : Script
         vulnerableAvatars.Remove(id);
         avatarRagdolls.Remove(id);
         avatarGaits.Remove(id);
+        avatarTracks.Remove(id);
         nextAvatarSpawn = clock.ElapsedMilliseconds + 500;
         // The player model is special and the scripted CreateChar path crashed on CE.
         Trace("creating remote player with ambient native; advertised model=" + modelHash);
@@ -1559,7 +1582,7 @@ public sealed class LibertyFriends : Script
         Trace("remote player configured");
     }
 
-    private void MoveAvatars(float step, long now)
+    private void MoveAvatars(long now)
     {
         foreach (var entry in worldCars)
         {
@@ -1619,9 +1642,12 @@ public sealed class LibertyFriends : Script
             }
             avatar.FreezePosition = true;
             Vector3 current = avatar.Position;
-            if (SquaredDistance(current, peer.Position) > 0.0001f)
-                SetPedPosition(avatar, Blend(current, peer.Position, step));
-            avatar.Heading = peer.Heading;
+            PoseTrack walking;
+            Pose pose = avatarTracks.TryGetValue(entry.Key, out walking)
+                ? walking.Read(now - 75, true) : new Pose { Position = peer.Position, Heading = peer.Heading };
+            if (SquaredDistance(current, pose.Position) > 0.0001f)
+                SetPedPosition(avatar, pose.Position);
+            avatar.Heading = pose.Heading;
         }
     }
 
@@ -2014,12 +2040,6 @@ public sealed class LibertyFriends : Script
             from.Z + (to.Z - from.Z) * step, from.W + (to.W - from.W) * step));
     }
 
-    private static Vector3 Blend(Vector3 current, Vector3 target, float step)
-    {
-        if (SquaredDistance(current, target) > 225f) return target;
-        return Lerp(current, target, step);
-    }
-
     private static Vector3 Lerp(Vector3 current, Vector3 target, float step)
     {
         return new Vector3(current.X + (target.X - current.X) * step,
@@ -2115,6 +2135,7 @@ public sealed class LibertyFriends : Script
             if (Exists(avatar)) avatar.Delete();
         avatars.Clear();
         avatarGaits.Clear();
+        avatarTracks.Clear();
         vulnerableAvatars.Clear();
         avatarRagdolls.Clear();
         foreach (string id in new List<string>(cars.Keys)) RemoveCar(id);

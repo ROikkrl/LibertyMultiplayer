@@ -3,6 +3,7 @@ import hmac
 import os
 import re
 import secrets
+import select
 import socket
 import time
 from pathlib import Path
@@ -10,6 +11,8 @@ from release_updates import VERSION
 
 MAX_PLAYERS = 4
 TIMEOUT = 3.0
+REPLY_WINDOW = 2.0
+LOSS_NOTICE = 0.8
 INTERVAL = 1 / 30
 PACKET_LIMIT = 1200
 PLAYER_ID = re.compile(rb"[0-9a-f]{16}")
@@ -134,7 +137,7 @@ def open_packet(key, packet):
 def validate_reply(response, challenge, version=VERSION):
     fields = response.split()
     if len(fields) == 3 and fields[1] == challenge and VERSION_TOKEN.fullmatch(fields[2]):
-        if fields[0] == b"LF-VERSION" or fields[0] == b"LF-PONG" and fields[2] != version.encode("ascii"):
+        if fields[0] in (b"LF-VERSION", b"LF-PONG") and fields[2] != version.encode("ascii"):
             raise VersionMismatch(fields[2].decode("ascii"), version)
         if fields[0] == b"LF-PONG":
             return
@@ -142,20 +145,30 @@ def validate_reply(response, challenge, version=VERSION):
 
 
 def probe_connection(sock, key, version=VERSION):
-    challenge = secrets.token_hex(8).encode("ascii")
-    sock.settimeout(1)
-    started = time.monotonic()
-    sock.send(seal(key, b" ".join((b"LF-PING", challenge, version.encode("ascii")))))
-    try:
-        response = open_packet(key, sock.recv(PACKET_LIMIT + 1))
-    except socket.timeout:
-        # Pre-version servers respond to a two-field probe without reporting their version.
-        sock.send(seal(key, b"LF-PING " + challenge))
-        response = open_packet(key, sock.recv(PACKET_LIMIT + 1))
-        if response == b"LF-PONG " + challenge:
-            raise VersionMismatch("не сообщается устаревшим сервером", version)
-    validate_reply(response, challenge, version)
-    return round((time.monotonic() - started) * 1000)
+    for attempt in range(3):
+        legacy = attempt == 2
+        challenge = secrets.token_hex(8).encode("ascii")
+        started = time.monotonic()
+        payload = b"LF-PING " + challenge
+        if not legacy:
+            payload += b" " + version.encode("ascii")
+        sock.send(seal(key, payload))
+        deadline = time.monotonic() + 0.65
+        while (remaining := deadline - time.monotonic()) > 0:
+            sock.settimeout(remaining)
+            try:
+                response = open_packet(key, sock.recv(PACKET_LIMIT + 1))
+                if legacy and response == b"LF-PONG " + challenge:
+                    raise VersionMismatch("не сообщается устаревшим сервером", version)
+                validate_reply(response, challenge, version)
+                return round((time.monotonic() - started) * 1000)
+            except VersionMismatch:
+                raise
+            except socket.timeout:
+                break
+            except ValueError:
+                continue
+    raise TimeoutError("No matching probe reply")
 
 
 def check_server(host, port, key, version=VERSION):
@@ -187,7 +200,7 @@ def serve(args):
                     kind = b"LF-PONG" if parts[2:] == [WIRE_VERSION] else b"LF-VERSION"
                     sock.sendto(seal(args.key, b" ".join((kind, parts[1], WIRE_VERSION))), address)
                     continue
-                if len(parts) == 2 and parts[0] == b"LF-LEAVE":
+                if len(parts) == 3 and parts[0] == b"LF-LEAVE":
                     peer = players.get(parts[1])
                     if peer is not None and peer[2] == address:
                         del players[parts[1]]
@@ -236,10 +249,13 @@ class WorldExchange:
         self.last_upload = None
         self.requests = {}
         self.received_at = 0
+        self.uploads = {}
 
     def pause(self):
         self.requests.clear()
         self.last_upload = None
+        self.uploads.clear()
+        self.next_poll = 0.0
 
     def poll(self, sock, sample):
         now = time.monotonic()
@@ -247,7 +263,9 @@ class WorldExchange:
             return
         self.next_poll = now + 0.1
         self.requests = {token: state for token, state in self.requests.items()
-                         if now - state[0] < 0.5}
+                         if now - state[0] < REPLY_WINDOW}
+        self.uploads = {seq: value for seq, value in self.uploads.items()
+                        if now - value[0] < REPLY_WINDOW}
         try:
             frame = self.outgoing.read_bytes()
         except OSError:
@@ -268,16 +286,21 @@ class WorldExchange:
                 if take:
                     sock.send(seal(self.key, b" ".join((b"LFWT", self.player_id, *take.groups()))))
             total = max(1, (len(rows) + WORLD_PAGE_ROWS - 1) // WORLD_PAGE_ROWS)
+            packets = []
             for page in range(total):
                 prefix = b" ".join((b"LFWU", self.player_id, sequence, episode,
                                     str(page).encode("ascii"), str(total).encode("ascii")))
                 selected = rows[page * WORLD_PAGE_ROWS:(page + 1) * WORLD_PAGE_ROWS]
                 payload = prefix + b"\n" + b"\n".join(selected)
-                if len(payload) + 32 <= PACKET_LIMIT:
-                    sock.send(seal(self.key, payload))
+                if len(payload) + 32 > PACKET_LIMIT:
+                    return
+                packets.append(seal(self.key, payload))
+            self.uploads[sequence] = (now, packets, False)
+            for packet in packets:
+                sock.send(packet)
             self.last_upload = frame
         token = secrets.token_hex(8).encode("ascii")
-        self.requests[token] = (now, time.monotonic_ns(), sample, episode, {})
+        self.requests[token] = (now, time.monotonic_ns(), sample, episode, {}, False)
         sock.send(seal(self.key, b" ".join((b"LFWQ", self.player_id, token, episode))))
 
     def receive(self, response):
@@ -291,9 +314,8 @@ class WorldExchange:
         index, total = int(index), int(total)
         if not 0 <= index < total <= WORLD_MAX_PAGES or len(rows.splitlines()) > WORLD_PAGE_ROWS:
             return
-        _, timestamp, sample, episode, pages = self.requests[token]
+        _, timestamp, sample, episode, pages, _ = self.requests[token]
         if timestamp <= self.received_at:
-            del self.requests[token]
             return
         if pages and next(iter(pages.values()))[:2] != (owner, total):
             return
@@ -304,7 +326,128 @@ class WorldExchange:
         self.temporary.write_bytes(header + b"\n" + b"".join(pages[page][2] for page in range(total)))
         self.temporary.replace(self.incoming)
         self.received_at = timestamp
-        del self.requests[token]
+
+    def repair_download(self, sock, now):
+        for token, request in reversed(self.requests.items()):
+            started, timestamp, _, _, pages, attempted = request
+            if not pages or timestamp <= self.received_at:
+                continue
+            if not attempted and now - started >= 0.12:
+                total = next(iter(pages.values()))[1]
+                missing = sum(1 << page for page in range(total) if page not in pages)
+                if missing:
+                    payload = b" ".join((b"LFWR", self.player_id, token, str(missing).encode("ascii")))
+                    sock.send(seal(self.key, payload))
+                    self.requests[token] = (*request[:5], True)
+            break
+
+    def repair_upload(self, sock, response):
+        fields = response.split()
+        if len(fields) != 4 or fields[1] not in self.requests or not fields[3].isdigit():
+            return
+        sequence = fields[2]
+        stored = self.uploads.get(sequence)
+        if stored is None or stored[2]:
+            return
+        sent, packets, _ = stored
+        mask = int(fields[3])
+        if not 0 < mask < (1 << len(packets)):
+            return
+        self.uploads[sequence] = (sent, packets, True)
+        for index, packet in enumerate(packets):
+            if mask & (1 << index):
+                sock.send(packet)
+
+
+class PeerExchange:
+    def __init__(self, directory, player_id, key, power, server_address):
+        self.player_id = player_id
+        self.key = key
+        self.power = power
+        self.server_address = server_address
+        self.output = directory / "peers.txt"
+        self.temporary = directory / "peers.tmp"
+        self.pending = {}
+        self.last_sample = -1
+        self.last_reply = 0.0
+        self.peer_count = 0
+        self.latest = -1
+
+    def pause(self):
+        self.pending.clear()
+        self.last_reply = 0.0
+
+    def leave(self, sock):
+        if self.last_sample >= 0:
+            payload = b" ".join((b"LF-LEAVE", self.player_id, str(self.last_sample).encode("ascii")))
+            sock.send(seal(self.key, payload))
+
+    def send(self, sock, position, now):
+        tick, play, vehicle, *fields = position.split()
+        sample = int(tick)
+        if sample <= self.last_sample or not play.isdigit() or (
+                vehicle != b"-" and not TRAFFIC_KEY.fullmatch(vehicle)):
+            return
+        challenge = secrets.token_hex(8).encode("ascii")
+        payload = b" ".join((b"LF1", self.player_id, challenge, WIRE_VERSION, self.power, play, vehicle,
+                             coordinates(fields)))
+        self.pending = {token: item for token, item in self.pending.items() if now - item[0] < REPLY_WINDOW}
+        sock.send(seal(self.key, payload))
+        self.pending[challenge] = (now, sample)
+        self.last_sample = sample
+
+    def receive(self, response):
+        header, _, rows = response.partition(b"\n")
+        fields = header.split()
+        if response.startswith(b"LF-VERSION "):
+            if len(fields) >= 2 and fields[1] in self.pending:
+                validate_reply(response, fields[1])
+            return
+        if not fields or len(fields) not in (1, 2, 7) or not response.endswith(b"\n"):
+            return
+        query = self.pending.pop(fields[0], None)
+        if query is None or query[1] <= self.latest or time.monotonic() - query[0] >= REPLY_WINDOW:
+            return
+        if len(fields) >= 2 and fields[1] != b"-" and not PLAYER_ID.fullmatch(fields[1]):
+            return
+        if len(fields) == 7 and (
+            not fields[2].isdigit() or not fields[3].isdigit() or fields[4] not in (b"0", b"1", b"2", b"3") or
+            not all(re.fullmatch(rb"-?[0-9]{1,3}", value) for value in fields[5:])
+        ):
+            return
+        stamp = str(time.monotonic_ns()).encode("ascii")
+        if len(fields) > 1:
+            sample = str(query[1]).encode("ascii")
+            stamp = b":".join((stamp, sample, self.server_address, self.player_id))
+            stamp += b" " + b" ".join(fields[1:])
+        self.temporary.write_bytes(stamp + b"\n" + rows)
+        self.temporary.replace(self.output)
+        self.latest = query[1]
+        self.last_reply = time.monotonic()
+        self.peer_count = len(rows.splitlines())
+
+
+def receive_network(sock, peer, world, deadline):
+    while (remaining := deadline - time.monotonic()) > 0:
+        try:
+            ready, _, _ = select.select([sock], [], [], remaining)
+            if not ready:
+                return
+            packet = sock.recv(PACKET_LIMIT + 1)
+        except OSError:
+            return
+        try:
+            response = open_packet(peer.key, packet)
+            if response.startswith(b"LFW1 "):
+                world.receive(response)
+            elif response.startswith(b"LFWN "):
+                world.repair_upload(sock, response)
+            else:
+                peer.receive(response)
+        except VersionMismatch:
+            raise
+        except (OSError, ValueError):
+            continue
 
 
 def join(args, stop=None, report=print):
@@ -312,11 +455,8 @@ def join(args, stop=None, report=print):
     if not any((directory / marker).is_file() for marker in ("bridge.txt", "manifest.lua")):
         raise SystemExit(f"Mod not found in {directory}")
     local_file = directory / "position.txt"
-    peer_file = directory / "peers.txt"
-    temporary_file = directory / "peers.tmp"
     bridge_file = directory / "bridge-live.txt"
     player_id = secrets.token_hex(8).encode("ascii")
-    world = WorldExchange(directory, player_id, args.key)
     (directory / "player.txt").write_bytes(player_id)
     bridge_temporary = directory / ("bridge-" + player_id.decode("ascii") + ".tmp")
     next_heartbeat = 0.0
@@ -328,13 +468,18 @@ def join(args, stop=None, report=print):
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.connect((args.host, args.port))
         probe_connection(sock, args.key)
+        sock.setblocking(False)
         power = str(getattr(args, "power", suggested_power())).encode("ascii")
         server_address = sock.getpeername()[0].encode("ascii")
-        pause_marker = b"PAUSED " + player_id + b"\n"
-        leave_packet = seal(args.key, b"LF-LEAVE " + player_id)
+        peer = PeerExchange(directory, player_id, args.key, power, server_address)
+        world = WorldExchange(directory, player_id, args.key)
         status = None
+        leave_retries = 0
+        next_leave = 0.0
+        next_tick = time.monotonic()
         while stop is None or not stop.is_set():
             started = time.monotonic()
+            next_tick = max(next_tick + INTERVAL, started + INTERVAL / 2)
             next_status = "Waiting for GTA IV"
             if started >= next_heartbeat:
                 try:
@@ -345,72 +490,64 @@ def join(args, stop=None, report=print):
                     # The game may have the file open briefly.
                     next_heartbeat = started + INTERVAL
             try:
-                position = local_file.read_bytes()
-                if position != last_position:
-                    last_position, last_change = position, started
-                if position == pause_marker:
+                try:
+                    position = local_file.read_bytes()
+                except OSError:
+                    position = b""
+                if position.endswith(b"\n"):
+                    if position != last_position:
+                        last_position, last_change = position, started
+                else:
+                    position = last_position or b""
+                if position == b"PAUSED " + player_id + b"\n":
                     next_status = "Paused in GTA IV"
                     if status != next_status:
+                        peer.pause()
                         world.pause()
-                        sock.send(leave_packet)
+                        leave_retries = 3
+                        next_leave = started
+                    if leave_retries and started >= next_leave:
+                        leave_retries -= 1
+                        next_leave = started + 0.12
+                        peer.leave(sock)
                 elif position.endswith(b"\n") and started - last_change < TIMEOUT:
-                    tick, play, vehicle, *fields = position.split()
-                    if not play.isdigit() or (vehicle != b"-" and not TRAFFIC_KEY.fullmatch(vehicle)):
-                        raise ValueError("unrecognized game state")
-                    sample = str(int(tick)).encode("ascii")
-                    challenge = secrets.token_hex(8).encode("ascii")
-                    payload = b" ".join((b"LF1", player_id, challenge, WIRE_VERSION, power, play, vehicle,
-                                         coordinates(fields)))
+                    leave_retries = 0
                     next_status = "Waiting for the server"
-                    sock.send(seal(args.key, payload))
-                    deadline = started + 0.15
-                    while time.monotonic() < deadline:
-                        sock.settimeout(max(0.001, deadline - time.monotonic()))
-                        response = open_packet(args.key, sock.recv(65535))
-                        if response.startswith(b"LF-VERSION "):
-                            validate_reply(response, challenge)
-                        if response.startswith(b"LFW1 "):
-                            try:
-                                world.receive(response)
-                            except OSError:
-                                pass
-                            continue
-                        header, _, rows = response.partition(b"\n")
-                        fields = header.split()
-                        if not fields or fields[0] != challenge or len(fields) not in (1, 2, 7):
-                            continue
-                        if len(fields) >= 2 and fields[1] != b"-" and not PLAYER_ID.fullmatch(fields[1]):
-                            continue
-                        if len(fields) == 7 and (
-                            not fields[2].isdigit() or not fields[3].isdigit() or
-                            fields[4] not in (b"0", b"1", b"2", b"3") or
-                            not all(re.fullmatch(rb"-?[0-9]{1,3}", value) for value in fields[5:])
-                        ):
-                            continue
-                        bridge_header = str(time.monotonic_ns()).encode()
-                        if len(fields) > 1:
-                            source = b":".join((bridge_header, sample, server_address, player_id))
-                            bridge_header = source + b" " + b" ".join(fields[1:])
-                        temporary_file.write_bytes(bridge_header + b"\n" + rows)
-                        temporary_file.replace(peer_file)
-                        next_status = f"Connected — other players: {len(rows.splitlines())}"
-                        try:
-                            world.poll(sock, sample)
-                        except OSError:
-                            pass
-                        break
+                    sample = int(position.partition(b" ")[0])
+                    if sample + 500 < peer.last_sample:
+                        peer.leave(sock)
+                        player_id = secrets.token_hex(8).encode("ascii")
+                        (directory / "player.txt").write_bytes(player_id)
+                        bridge_temporary = directory / ("bridge-" + player_id.decode("ascii") + ".tmp")
+                        next_heartbeat = 0.0
+                        peer = PeerExchange(directory, player_id, args.key, power, server_address)
+                        world = WorldExchange(directory, player_id, args.key)
+                    peer.send(sock, position, started)
+                    if peer.last_reply:
+                        world.poll(sock, str(peer.last_sample).encode("ascii"))
+                        world.repair_download(sock, started)
             except VersionMismatch:
                 raise
             except (OSError, ValueError):
                 pass
+            receive_network(sock, peer, world, next_tick)
+            if next_status == "Waiting for the server" and peer.last_reply:
+                if time.monotonic() - peer.last_reply < LOSS_NOTICE:
+                    next_status = f"Connected — other players: {peer.peer_count}"
+                else:
+                    next_status = "Reconnecting to the server"
             if next_status != status:
                 status = next_status
                 report(status)
-            delay = max(0, INTERVAL - (time.monotonic() - started))
+            delay = max(0, next_tick - time.monotonic())
             if stop is None:
                 time.sleep(delay)
             else:
                 stop.wait(delay)
+        try:
+            peer.leave(sock)
+        except OSError:
+            pass
 
 
 def cli():

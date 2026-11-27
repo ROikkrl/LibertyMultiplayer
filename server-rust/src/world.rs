@@ -1,5 +1,5 @@
 use super::{distance_squared, valid_id, Player};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -17,6 +17,9 @@ const SIMULATION_RADIUS: f64 = 115.0;
 const MAX_TRAFFIC: usize = 384;
 const MAX_DELEGATED: usize = 8;
 const MAX_PRIORITY_SECONDS: u64 = 3600;
+const WORLD_REPLY_TTL: Duration = Duration::from_secs(2);
+const WORLD_REPLY_LIMIT: usize = 20;
+const INCOMING_LIMIT: usize = 6;
 
 fn priority(power: u8, elapsed: Duration) -> u64 {
     u64::from(power) * elapsed.as_secs().min(MAX_PRIORITY_SECONDS)
@@ -114,12 +117,21 @@ struct Frame {
 struct Incoming {
     sequence: u64,
     pages: Vec<Option<Vec<Entity>>>,
+    repair_sent: bool,
+}
+
+struct ReplyPages {
+    challenge: String,
+    sent: Instant,
+    pages: Vec<String>,
+    repaired: bool,
 }
 
 struct Publisher {
     seen: Instant,
     episode: u8,
-    incoming: Option<Incoming>,
+    incoming: Vec<Incoming>,
+    replies: VecDeque<ReplyPages>,
     frame: Option<Frame>,
 }
 
@@ -200,7 +212,7 @@ impl World {
             let was_source = self.sources.get(id) == Some(id);
             let is_source = sources.get(id) == Some(id);
             if was_source != is_source {
-                publisher.incoming = None;
+                publisher.incoming.clear();
                 if let Some(frame) = &mut publisher.frame {
                     frame.ambient = false;
                     frame.entities.retain(|item| item.kind == b'd');
@@ -345,6 +357,22 @@ impl World {
             return None;
         }
         match action {
+            "LFWR" => {
+                let challenge = fields.next()?;
+                let mask: u8 = fields.next()?.parse().ok()?;
+                if fields.next().is_some() || !body.is_empty() || !valid_id(challenge) {
+                    return None;
+                }
+                let publisher = self.publishers.get_mut(id)?;
+                let reply = publisher.replies.iter_mut().find(|reply| reply.challenge == challenge &&
+                    now.duration_since(reply.sent) < WORLD_REPLY_TTL && !reply.repaired)?;
+                if mask == 0 || usize::from(mask) >= (1 << reply.pages.len()) {
+                    return None;
+                }
+                reply.repaired = true;
+                Some(reply.pages.iter().enumerate().filter(|(page, _)| mask & (1 << page) != 0)
+                    .map(|(_, page)| page.clone()).collect())
+            }
             "LFWT" => {
                 let source = fields.next()?;
                 let handle = fields.next()?.parse().ok()?;
@@ -363,16 +391,40 @@ impl World {
                     return None;
                 }
                 let publisher = self.publishers.entry(id.to_owned()).or_insert(Publisher {
-                    seen: now, episode, incoming: None, frame: None,
+                    seen: now, episode, incoming: Vec::new(), replies: VecDeque::new(), frame: None,
                 });
                 if publisher.episode != episode {
                     publisher.episode = episode;
-                    publisher.incoming = None;
+                    publisher.incoming.clear();
+                    publisher.replies.clear();
                     publisher.frame = None;
                 }
                 publisher.seen = now;
                 self.reconcile(players, now);
-                Some(self.snapshot(id, challenge, player, players, now))
+                let pages = self.snapshot(id, challenge, player, players, now);
+                let publisher = self.publishers.get_mut(id)?;
+                publisher.replies.retain(|reply| now.duration_since(reply.sent) < WORLD_REPLY_TTL);
+                if let Some(saved) = publisher.replies.iter().find(|reply| reply.challenge == challenge) {
+                    return Some(saved.pages.clone());
+                }
+                if publisher.replies.len() >= WORLD_REPLY_LIMIT {
+                    publisher.replies.pop_front();
+                }
+                publisher.replies.push_back(ReplyPages {
+                    challenge: challenge.to_owned(), sent: now, pages: pages.clone(), repaired: false,
+                });
+                let mut outgoing = pages;
+                if let Some(incoming) = publisher.incoming.iter_mut().max_by_key(|item| item.sequence) {
+                    if !incoming.repair_sent {
+                        let missing = incoming.pages.iter().enumerate().filter(|(_, page)| page.is_none())
+                            .fold(0, |mask, (index, _)| mask | (1 << index));
+                        if missing != 0 {
+                            incoming.repair_sent = true;
+                            outgoing.push(format!("LFWN {challenge} {} {missing}", incoming.sequence));
+                        }
+                    }
+                }
+                Some(outgoing)
             }
             "LFWU" => {
                 let sequence: u64 = fields.next()?.parse().ok()?;
@@ -397,21 +449,28 @@ impl World {
                     }
                     entities.push(Entity::parse(row, now, sequence)?);
                 }
-                let pages = publisher.incoming.get_or_insert_with(|| Incoming {
-                    sequence, pages: (0..total).map(|_| None).collect(),
-                });
-                if sequence < pages.sequence {
-                    return None;
-                }
-                if sequence > pages.sequence {
-                    *pages = Incoming { sequence, pages: (0..total).map(|_| None).collect() };
-                }
+                let index_of_frame = match publisher.incoming.iter().position(|item| item.sequence == sequence) {
+                    Some(index) => index,
+                    None => {
+                        if publisher.incoming.len() >= INCOMING_LIMIT {
+                            let (oldest, pending) = publisher.incoming.iter().enumerate().min_by_key(|(_, item)| item.sequence)?;
+                            if sequence < pending.sequence {
+                                return None;
+                            }
+                            publisher.incoming.swap_remove(oldest);
+                        }
+                        publisher.incoming.push(Incoming { sequence, pages: (0..total).map(|_| None).collect(), repair_sent: false });
+                        publisher.incoming.len() - 1
+                    }
+                };
+                let pages = &mut publisher.incoming[index_of_frame];
                 if total != pages.pages.len() || pages.pages[index].is_some() {
                     return None;
                 }
                 pages.pages[index] = Some(entities);
                 if pages.pages.iter().all(Option::is_some) {
-                    let complete = publisher.incoming.take()?;
+                    let complete = publisher.incoming.swap_remove(index_of_frame);
+                    publisher.incoming.retain(|item| item.sequence > sequence);
                     let mut unique = HashSet::new();
                     let (traffic, entities) = complete.pages.into_iter().flatten().flatten().filter(|item| {
                         let distance = distance_squared(item.position, player.position);

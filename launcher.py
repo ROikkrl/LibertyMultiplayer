@@ -222,6 +222,8 @@ class Launcher:
                 message = "Отключено в GTA IV. Нажми F9 для подключения."
             elif message == "Waiting for the server":
                 message = "Ожидание ответа от сервера."
+            elif message == "Reconnecting to the server":
+                message = "Связь прервалась. Переподключаюсь…"
             self.status.set(message)
             if finished:
                 self.worker = None
