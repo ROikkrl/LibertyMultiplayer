@@ -32,4 +32,15 @@ python ivmp-ce/tools/prepare.py work/ivmp-ce-upstream
 ./ivmp-ce/build.ps1 -Toolset v143
 ```
 
-Для сборки решения нужны MSBuild, x86 C++ Build Tools и Windows SDK. С MSVC v143 проверены компиляция исходного клиента и сборка оригинального Windows-сервера с сетевой библиотекой. Сервер проверен на запуске штатного сценария и ответах на локальные UDP-запросы. [Установка MSVC Build Tools](https://learn.microsoft.com/en-us/cpp/overview/acquire-msvc)
+Для сборки решения нужны MSBuild, x86 C++ Build Tools и Windows SDK. Решение собрано в конфигурации Release Win32 с MSVC v143 и Windows SDK 10.0.26100.0. Сервер запустил штатный сценарий, ответил на локальные UDP-запросы и подтвердил вход двух тестовых клиентов сообщениями `JoinedGame`. [Установка MSVC Build Tools](https://learn.microsoft.com/en-us/cpp/overview/acquire-msvc)
+
+## Проверка входа двух клиентов
+
+Соберите тест из консоли разработчика MSVC x86. Запустите локальный сервер с двумя свободными слотами и без пароля. Тест подключается к `127.0.0.1` и использует `Network.Core.dll` из текущей папки.
+
+```powershell
+$upstream = (Resolve-Path 'work/ivmp-ce-upstream').Path
+cl /nologo /EHsc /MD /std:c++14 /DWIN32 /DWIN32_LEAN_AND_MEAN /D_CRT_SECURE_NO_WARNINGS "/I$upstream/Shared" ivmp-ce/tests/peers.cpp "$upstream/Shared/CString.cpp" "$upstream/Shared/Network/CBitStream.cpp" "$upstream/Shared/Game/CControlState.cpp" "/Fe:$upstream/Binary/ivmp-ce-peers.exe" /link ws2_32.lib
+Push-Location "$upstream/Binary"
+try { ./ivmp-ce-peers.exe 9999 } finally { Pop-Location }
+```
