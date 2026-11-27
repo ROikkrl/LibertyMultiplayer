@@ -34,6 +34,17 @@ PvP и рагдоллы включаются автоматически вмес
 
 Лаунчер проверяет последний стабильный релиз GitHub и открывает страницу Releases, если указан репозиторий. Для локальной сборки поместите рядом с EXE файл `release-repo.txt` с `владелец/репозиторий`.
 
+## Локальный патч Vladivostok FM
+
+Поместите `LibertyMultiplayer-Radio.zip` рядом с лаунчером, не распаковывая архив. При запуске лаунчер включит опцию «Установить патч Vladivostok FM». Укажите папку игры и установите мод. Радиопатч использует каталог `update` и при необходимости устанавливает FusionFix из локального архива. При замене существующих файлов лаунчер сохраняет их резервные копии. Клиент и сервер продолжают использовать протокол 0.2.12.
+
+Для самостоятельной сборки распакуйте `Resources/Radio Restorer/data1.dat` из [Radio Restoration](https://github.com/Tomasak/GTA-Downgraders/releases/iv-latest) и поверх него распакуйте `opVANILLA.dat`. Передайте папку с получившимся `update` скрипту `tools/build_radio_patch.py` через `--restoration`. Для сборки также нужны `pyrpfiv`, FFmpeg, `IVAudioConv.exe` с его библиотеками из [RAGE Audio Toolkit](https://github.com/AndrewMulti/RAGE-Audio-Toolkit), [ZIP FusionFix](https://github.com/ThirteenAG/GTAIV.EFLC.FusionFix/releases/tag/v5.1.2), установленная GTA IV и два локальных аудиофайла.
+
+```powershell
+python -m pip install pyrpfiv
+python tools/build_radio_patch.py --restoration "C:\RadioRestoration" --game "C:\Games\GTAIV" --ffmpeg "C:\Tools\ffmpeg.exe" --converter "C:\Tools\IVAudioConv.exe" --fusionfix "C:\Downloads\GTAIV.EFLC.FusionFix.zip" --output LibertyMultiplayer-Radio.zip track1.mp3 track2.mp3
+```
+
 ## Ручная установка из исходников
 
 1. Нужна Steam-сборка GTA IV `1.2.0.59` и Python 3.10 или новее.

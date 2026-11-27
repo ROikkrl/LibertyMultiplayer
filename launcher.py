@@ -1,12 +1,13 @@
 import argparse
 import queue
+import sys
 import threading
 import tkinter as tk
 import webbrowser
 from pathlib import Path
 from tkinter import filedialog, ttk
 
-from installer import install
+from installer import RADIO_PATCH_NAME, install
 from launcher_settings import load_settings, save_settings
 from liberty_friends import VersionMismatch, check_server, join, parse_power, suggested_power
 from release_updates import VERSION, latest_update, repository
@@ -29,6 +30,9 @@ class Launcher:
         self.port = tk.StringVar(value=settings.get("port", "24840"))
         self.key = tk.StringVar(value=settings.get("key", ""))
         self.power = tk.StringVar(value=settings.get("power", f"{suggested_power() / 100:.2f}"))
+        launcher_path = Path(sys.executable) if getattr(sys, "frozen", False) else Path(__file__)
+        self.radio_patch = launcher_path.resolve().with_name(RADIO_PATCH_NAME)
+        self.install_radio = tk.BooleanVar(value=self.radio_patch.is_file())
         self.save_timer = None
         self.status = tk.StringVar(value="Закрой GTA IV и выбери папку игры для установки.")
         root.title(f"LibertyMultiplayer {VERSION}")
@@ -52,6 +56,12 @@ class Launcher:
         self.install_button.grid(row=0, column=2, padx=(8, 0))
         self.patch_button = ttk.Button(panel, text="Патчить выбранную папку", command=self.patch_selected)
         self.patch_button.grid(row=1, column=2, padx=(8, 0))
+        self.radio_checkbox = None
+        if self.install_radio.get():
+            self.radio_checkbox = ttk.Checkbutton(
+                panel, text="Установить патч Vladivostok FM", variable=self.install_radio,
+            )
+            self.radio_checkbox.grid(row=9, column=0, columnspan=3, sticky="w", pady=(8, 0))
         self.button = ttk.Button(panel, text="Подключиться", command=self.toggle)
         self.button.grid(row=5, column=1, sticky="w", pady=(10, 4))
         self.check_button = ttk.Button(panel, text="Проверить сервер", command=self.probe)
@@ -145,17 +155,22 @@ class Launcher:
         self.install_button.config(state="disabled")
         self.patch_button.config(state="disabled")
         self.button.config(state="disabled")
-        self.status.set("Проверяю папку и обновляю мод…")
-        threading.Thread(target=self.install_game, args=(selected,), daemon=True).start()
+        radio_patch = self.radio_patch if self.install_radio.get() else None
+        if self.radio_checkbox is not None:
+            self.radio_checkbox.config(state="disabled")
+        self.status.set("Устанавливаю мод и радиопатч…" if radio_patch else "Проверяю папку и обновляю мод…")
+        threading.Thread(target=self.install_game, args=(selected, radio_patch), daemon=True).start()
 
-    def install_game(self, selected):
+    def install_game(self, selected, radio_patch):
         try:
-            result = install(selected, Path(__file__).resolve().parent / "install_bundle")
+            result = install(selected, Path(__file__).resolve().parent / "install_bundle", radio_patch)
         except (ValueError, OSError, RuntimeError) as error:
             self.install_results.put((None, str(error)))
         else:
             game, backup = result
             message = "Готово. Подключись к серверу и загрузи сохранение в GTA IV."
+            if radio_patch:
+                message = "Vladivostok FM установлена. " + message
             if backup:
                 message += f" Резервная копия: {backup.name}"
             self.install_results.put((game, message))
@@ -212,6 +227,8 @@ class Launcher:
             self.install_button.config(state="normal")
             self.patch_button.config(state="normal")
             self.button.config(state="normal")
+            if self.radio_checkbox is not None:
+                self.radio_checkbox.config(state="normal")
         while not self.messages.empty():
             message, finished = self.messages.get_nowait()
             if message.startswith("Connected"):

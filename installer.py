@@ -6,10 +6,14 @@ import os
 import shutil
 import subprocess
 import tempfile
+import zipfile
 from pathlib import Path
 
 
 SUPPORTED_VERSION = (1, 2, 0, 59)
+RADIO_PATCH_NAME = "LibertyMultiplayer-Radio.zip"
+RADIO_PATCH_HEADER = b"LibertyMultiplayer Radio 1\n"
+FUSIONFIX_PLUGIN = "GTAIV.EFLC.FusionFix.asi"
 
 
 def game_version(executable):
@@ -83,7 +87,66 @@ def replace_file(source, target):
         temp.unlink(missing_ok=True)
 
 
-def install(selected, bundle):
+def unpack_radio_patch(archive_path, game, staging):
+    """Stage the selected radio add-on and its FusionFix dependency."""
+    has_fusionfix = any((game / directory / FUSIONFIX_PLUGIN).is_file()
+                        for directory in ("plugins", "scripts", "."))
+    files = {}
+    with zipfile.ZipFile(archive_path) as archive:
+        marker = archive.getinfo("liberty-radio.txt")
+        if marker.file_size != len(RADIO_PATCH_HEADER) or archive.read(marker) != RADIO_PATCH_HEADER:
+            raise ValueError("Нужен архив патча LibertyMultiplayer Radio.")
+
+        entries = {}
+        for member in archive.infolist():
+            if member == marker or member.is_dir():
+                continue
+            parts = member.filename.split("/")
+            if any(not part or part in (".", "..") or part.endswith((".", " ")) or
+                   any(char in part for char in '\\:<>"|?*') or Path(part).is_reserved()
+                   for part in parts):
+                raise ValueError(f"Недопустимый путь в архиве радио: {member.filename}")
+            filename = member.filename.lower()
+            if filename in entries:
+                raise ValueError(f"Повторяющийся файл в архиве радио: {member.filename}")
+            entries[filename] = member
+
+        required = (
+            "update/pc/audio/config/game.dat16", "update/pc/audio/config/sounds.dat15",
+            "update/pc/audio/config/rpf.xml", "update/pc/audio/sfx/radio_restoration.rpf",
+        )
+        if not all(name in entries and entries[name].file_size for name in required):
+            raise ValueError("В архиве отсутствуют файлы Vladivostok FM.")
+        if not has_fusionfix and f"fusionfix/plugins/{FUSIONFIX_PLUGIN.lower()}" not in entries:
+            raise ValueError("В архиве отсутствует FusionFix для загрузки радиопатча.")
+
+        for prefix in ("fusionfix/", ""):
+            for name, member in entries.items():
+                if prefix:
+                    if has_fusionfix or not name.startswith(prefix):
+                        continue
+                    relative = name.removeprefix(prefix)
+                    if not relative.startswith("update/") and relative not in (
+                        f"plugins/{FUSIONFIX_PLUGIN.lower()}", "plugins/gtaiv.eflc.fusionfix.ini",
+                    ):
+                        raise ValueError(f"Недопустимый файл FusionFix: {member.filename}")
+                else:
+                    if not name.startswith("update/"):
+                        continue
+                    relative = name
+                    if not relative.startswith((
+                        "update/pc/audio/", "update/common/text/", "update/tlad/", "update/tbogt/",
+                    )):
+                        raise ValueError(f"Недопустимый файл радиопатча: {member.filename}")
+                target = staging / Path(relative)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(member) as source, target.open("wb") as output:
+                    shutil.copyfileobj(source, output)
+                files[relative] = target
+    return files
+
+
+def install(selected, bundle, radio_patch=None):
     game = locate_game(selected)
     ensure_game_closed()
     payload = bundle / "game"
@@ -93,12 +156,22 @@ def install(selected, bundle):
     )
     if not all((payload / name).is_file() for name in required):
         raise ValueError("В этой сборке отсутствуют файлы установки. Открой готовый LibertyFriends.exe.")
-    files = list(payload.rglob("*"))
+    files = {source.relative_to(payload).as_posix(): source
+             for source in payload.rglob("*") if source.is_file()}
+    if radio_patch is None:
+        return install_files(game, bundle, files)
+    with tempfile.TemporaryDirectory(prefix="liberty-radio-install-") as staging:
+        try:
+            files.update(unpack_radio_patch(radio_patch, game, Path(staging)))
+        except (KeyError, zipfile.BadZipFile, NotImplementedError) as error:
+            raise ValueError("Не удалось прочитать архив радиопатча.") from error
+        return install_files(game, bundle, files)
+
+
+def install_files(game, bundle, files):
     changes = []
-    for source in files:
-        if not source.is_file():
-            continue
-        relative = source.relative_to(payload)
+    for name, source in files.items():
+        relative = Path(name)
         target = game / relative
         if not target.resolve().is_relative_to(game):
             raise ValueError(f"Путь установки выходит за пределы GTA IV: {relative}")
