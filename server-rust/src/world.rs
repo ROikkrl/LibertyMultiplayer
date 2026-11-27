@@ -192,10 +192,12 @@ pub struct World {
     traffic_epoch: Option<Instant>,
     hosts: HashMap<u8, String>,
     events: Vec<String>,
+    bowling: crate::bowling::Bowling,
 }
 
 impl World {
     pub fn reconcile(&mut self, players: &HashMap<String, Player>, now: Instant) {
+        self.bowling.tick(players, now);
         self.publishers.retain(|id, entry| {
             players.contains_key(id) && now.duration_since(entry.seen) < PRESENCE_TTL
         });
@@ -305,6 +307,7 @@ impl World {
     }
 
     pub fn remove(&mut self, id: &str) {
+        self.bowling.remove(id);
         self.publishers.remove(id);
         self.transfers.retain(|_, transfer| transfer.committed() || transfer.driver != id);
     }
@@ -471,6 +474,14 @@ impl World {
             return None;
         }
         match action {
+            "LFWB" => {
+                let sequence: u64 = fields.next()?.parse().ok()?;
+                let command = fields.next()?;
+                if fields.next().is_some() || !body.is_empty() { return None; }
+                let publisher = self.publishers.get(id)?;
+                self.bowling.handle(id, command, sequence, player, publisher.episode, now)?;
+                None
+            }
             "LFWR" => {
                 let challenge = fields.next()?;
                 let mask: u16 = fields.next()?.parse().ok()?;
@@ -645,6 +656,7 @@ impl World {
         if let Some(host) = self.hosts.get(&episode) {
             lines.push(format!("{host} 0 #\n"));
         }
+        if let Some(bowling) = self.bowling.snapshot(id, episode, now) { lines.push(bowling); }
         let mut local: Vec<_> = self.traffic.iter().filter(|((origin, _, _, _), vehicle)| {
             origin == id && vehicle.episode == episode && !vehicle.delegated &&
                 vehicle.simulator == id && now.duration_since(vehicle.state.seen) < FRAME_TTL

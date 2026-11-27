@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 mod world;
 mod status;
 mod transport;
+mod bowling;
 use status::EventLog;
 
 type PacketMac = Hmac<Sha256>;
@@ -254,8 +255,14 @@ fn parse_update(payload: &str, now: Instant, address: SocketAddr) -> Option<Upda
             if let Some(x) = parts.next() {
                 if !(-15_000..=15_000).contains(&x.parse::<i16>().ok()?) ||
                     !(-15_000..=15_000).contains(&parts.next()?.parse::<i16>().ok()?) ||
-                    !(-6_000..=6_000).contains(&parts.next()?.parse::<i16>().ok()?) ||
-                    parts.next().is_some() { return None; }
+                    !(-6_000..=6_000).contains(&parts.next()?.parse::<i16>().ok()?) { return None; }
+                if let Some(motion) = parts.next() {
+                    let suspension = parts.next()?;
+                    let animation = u32::from_str_radix(motion, 16).ok()?;
+                    if motion.len() != 8 || (animation >> 4) & 63 > 44 ||
+                        (suspension != "-" && (suspension.len() != 12 || !suspension.bytes().all(|byte| byte.is_ascii_hexdigit()))) ||
+                        parts.next().is_some() { return None; }
+                }
             }
         }
         write!(&mut state, " ~{meta}").ok()?;
@@ -333,7 +340,8 @@ fn apply_hit(player: &mut Player, kind: u8, damage: u32, impulse: [i16; 2], now:
     player.result.damage = player.result.damage.saturating_add(damage);
     player.result.hit_kind = kind;
     player.result.impulse = impulse;
-    player.result.hit_until = Some(now + Duration::from_millis(if kind == 3 { 1700 } else { 650 }));
+    let duration = match kind { 1 => 1100, 3 => 1700, _ => 650 };
+    player.result.hit_until = Some(now + Duration::from_millis(duration));
     if kind == 3 {
         player.result.last_ram = Some(now);
     }
@@ -347,13 +355,14 @@ fn simulate_hits(players: &mut HashMap<String, Player>, id: &str, target: &str,
         if input.sequence > player.result.acknowledged {
             player.result.acknowledged = input.sequence;
             let interval = if input.kind == 1 { 330 } else { 95 };
-            if input.kind != 0 && !input.ragdoll && eligible(player, now) &&
+            if input.kind != 0 && !input.ragdoll && (input.kind != 1 || !player.seated) && eligible(player, now) &&
                 ready(player.result.last_attack, now, interval) && target != id {
                 player.result.last_attack = Some(now);
                 let origin = player.position;
                 let range = if input.kind == 1 { 3.2_f64 } else { 180.0_f64 };
                 if let Some(victim) = players.get_mut(target) {
-                    if eligible(victim, now) && distance_squared(origin, victim.position) <= range.powi(2) {
+                    if eligible(victim, now) && (input.kind != 1 || !victim.seated) &&
+                        distance_squared(origin, victim.position) <= range.powi(2) {
                         apply_hit(victim, input.kind, if input.kind == 1 { 12 } else { 24 }, [0; 2], now);
                         log.record(format!("pvp_hit kind={} source={id} target={target}", input.kind));
                     }
@@ -476,7 +485,7 @@ fn serve(socket: &UdpSocket, signer: &PacketMac, mut log: EventLog, worker_count
             continue;
         }
         let now = Instant::now();
-        if ["LFWQ ", "LFWU ", "LFWT ", "LFWR "].iter().any(|prefix| payload.starts_with(prefix)) {
+        if ["LFWQ ", "LFWU ", "LFWT ", "LFWR ", "LFWB "].iter().any(|prefix| payload.starts_with(prefix)) {
             if let Some(pages) = world.handle(payload, sender, &players, now) {
                 for page in pages {
                     reply(socket, signer, page.as_bytes(), sender, &mut outgoing, &mut log, &mut status.counters);

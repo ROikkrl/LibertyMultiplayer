@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import zipfile
 from pathlib import Path
+from niko_assets import stage_niko
 
 
 SUPPORTED_VERSION = (1, 2, 0, 59)
@@ -158,13 +159,13 @@ def install(selected, bundle, radio_patch=None):
         raise ValueError("В этой сборке отсутствуют файлы установки. Открой готовый LibertyFriends.exe.")
     files = {source.relative_to(payload).as_posix(): source
              for source in payload.rglob("*") if source.is_file()}
-    if radio_patch is None:
-        return install_files(game, bundle, files)
-    with tempfile.TemporaryDirectory(prefix="liberty-radio-install-") as staging:
-        try:
-            files.update(unpack_radio_patch(radio_patch, game, Path(staging)))
-        except (KeyError, zipfile.BadZipFile, NotImplementedError) as error:
-            raise ValueError("Не удалось прочитать архив радиопатча.") from error
+    with tempfile.TemporaryDirectory(prefix="liberty-install-") as staging:
+        if radio_patch is not None:
+            try:
+                files.update(unpack_radio_patch(radio_patch, game, Path(staging)))
+            except (KeyError, zipfile.BadZipFile, NotImplementedError) as error:
+                raise ValueError("Не удалось прочитать архив радиопатча.") from error
+        files.update(stage_niko(game, Path(staging), files))
         return install_files(game, bundle, files)
 
 

@@ -17,11 +17,12 @@ PACKET_LIMIT = 1200
 PLAYER_ID = re.compile(rb"[0-9a-f]{16}")
 RIDE_ID = re.compile(rb"(?:-|[0-9a-f]{16}:-?[0-9]{1,10})")
 WORLD_ENTITY = re.compile(rb"(?:p(?:,-?[0-9]{1,11}){6}|v(?:,-?[0-9]{1,11}){6}(?:,-?[0-9]{1,4}){0,4})")
-STATE_META = re.compile(rb"~([0-9]{1,12}),([0-9]{1,12}),([01]),([0-9]{1,3}),(-1|[0-9]{1,3}),(-|[A-Za-z0-9_]{1,32})(?:,(-?[0-9]{1,4}),([0-9]{1,10}),([0-4])(?:,(-?[0-9]{1,5}),(-?[0-9]{1,5}),(-?[0-9]{1,4}))?)?")
+STATE_META = re.compile(rb"~([0-9]{1,12}),([0-9]{1,12}),([01]),([0-9]{1,3}),(-1|[0-9]{1,3}),(-|[A-Za-z0-9_]{1,32})(?:,(-?[0-9]{1,4}),([0-9]{1,10}),([0-4])(?:,(-?[0-9]{1,5}),(-?[0-9]{1,5}),(-?[0-9]{1,4})(?:,([0-9a-f]{8}),(-|[0-9a-f]{12}))?)?)?")
 COMBAT_META = re.compile(rb"!([0-7]),([0-9]{1,19}),([0-2]),(-|[0-9a-f]{16})")
 WORLD_PAGE_ROWS = 5
 WORLD_MAX_PAGES = 12
 VEHICLE_TAKE = re.compile(rb"t,([0-9a-f]{16}),([vc]),(-?[0-9]{1,10}),(-?[0-9]{1,10})")
+BOWLING_COMMAND = re.compile(rb"b,([0-9]{1,12}),(join(?:,-?[0-9]{1,7}){3},[0-9]{1,3}|leave|throw,-?[0-9]{1,3},[0-9]{1,3})")
 TRAFFIC_KEY = re.compile(rb"[0-9a-f]{16}:[vc]:-?[0-9]{1,10}:-?[0-9]{1,10}")
 WIRE_VERSION = VERSION.encode("ascii")
 VERSION_TOKEN = re.compile(rb"[0-9]+\.[0-9]+\.[0-9]+")
@@ -63,7 +64,8 @@ def coordinates(fields):
         if (not match or not -1 <= int(match[5]) <= 255 or int(match[4]) > 511 or
                 (match[7] is not None and (abs(int(match[7])) > 1000 or int(match[8]) > 0xFFFFFFFF)) or
                 (match[10] is not None and any(abs(int(match[i])) > maximum
-                                              for i, maximum in ((10, 15000), (11, 15000), (12, 6000))))):
+                                              for i, maximum in ((10, 15000), (11, 15000), (12, 6000)))) or
+                (match[13] is not None and (int(match[13], 16) >> 4) & 63 > 44)):
             raise ValueError("invalid state metadata")
         metadata = b" " + fields[-1]
         fields = fields[:-1]
@@ -273,7 +275,7 @@ class WorldExchange:
         except OSError:
             return
         lines = frame.splitlines()
-        if not lines or not frame.endswith(b"\n") or len(lines) > 2 + WORLD_PAGE_ROWS * WORLD_MAX_PAGES:
+        if not lines or not frame.endswith(b"\n") or len(lines) > 3 + WORLD_PAGE_ROWS * WORLD_MAX_PAGES:
             return
         header = lines[0].split()
         if len(header) != 3 or header[0] != self.player_id or not header[1].isdigit():
@@ -287,6 +289,10 @@ class WorldExchange:
                 take = VEHICLE_TAKE.fullmatch(rows.pop(0))
                 if take:
                     sock.send(seal(self.key, b" ".join((b"LFWT", self.player_id, *take.groups()))))
+            if rows and rows[0].startswith(b"b,"):
+                bowling = BOWLING_COMMAND.fullmatch(rows.pop(0))
+                if bowling:
+                    sock.send(seal(self.key, b" ".join((b"LFWB", self.player_id, *bowling.groups()))))
             if len(rows) > WORLD_PAGE_ROWS * WORLD_MAX_PAGES:
                 return
             total = max(1, (len(rows) + WORLD_PAGE_ROWS - 1) // WORLD_PAGE_ROWS)

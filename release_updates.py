@@ -7,7 +7,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 
-VERSION = "0.2.17"
+VERSION = "0.2.18"
 REPOSITORY_PATTERN = re.compile(r"[A-Za-z0-9-]+/[A-Za-z0-9_.-]+")
 VERSION_PATTERN = re.compile(r"v?(\d+)\.(\d+)\.(\d+)")
 
