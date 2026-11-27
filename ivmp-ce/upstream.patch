@@ -124,10 +124,10 @@ index 207cab5..42a690a 100644
      m_pPedPool = new CIVPool<IVPed>(*(IVPool **)COffsets::VAR_PedPool);
      m_pVehiclePool = new CIVPool<IVVehicle>(*(IVPool **)COffsets::VAR_VehiclePool);
 diff --git a/Client/Core/Client.Core.vcxproj b/Client/Core/Client.Core.vcxproj
-index 775d25e..4b0d392 100644
+index 775d25e..776a11f 100644
 --- a/Client/Core/Client.Core.vcxproj
 +++ b/Client/Core/Client.Core.vcxproj
-@@ -161,6 +161,14 @@
+@@ -161,6 +161,15 @@
      <ClInclude Include="CGameFileChecker.h" />
      <ClInclude Include="CModelManager.h" />
      <ClInclude Include="COffsets.h" />
@@ -137,6 +137,7 @@ index 775d25e..4b0d392 100644
 +    <ClInclude Include="CompleteEdition\CELocalPlayer.h" />
 +    <ClInclude Include="CompleteEdition\CENativeCall.h" />
 +    <ClInclude Include="CompleteEdition\CERemoteActors.h" />
++    <ClInclude Include="CompleteEdition\CEPlayerSlots.h" />
 +    <ClInclude Include="CompleteEdition\CESession.h" />
 +    <ClInclude Include="CompleteEdition\CESessionRuntime.h" />
      <ClInclude Include="CPools.h" />
@@ -242,7 +243,7 @@ index 1170246..e6e0585 100644
  template <typename T>
  struct CSimpleCollection
 diff --git a/Client/Core/Main.cpp b/Client/Core/Main.cpp
-index eca31da..1e78937 100644
+index eca31da..893779d 100644
 --- a/Client/Core/Main.cpp
 +++ b/Client/Core/Main.cpp
 @@ -10,9 +10,41 @@
@@ -287,7 +288,7 @@ index eca31da..1e78937 100644
  BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
  {
  	switch(fdwReason)
-@@ -22,6 +54,35 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
+@@ -22,6 +54,36 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
  			// Disable thread library notifications
  			DisableThreadLibraryCalls(hModule);
  
@@ -315,6 +316,7 @@ index eca31da..1e78937 100644
 +					pump.Remove();
 +					return FALSE;
 +				}
++				ivmp_ce::SessionRuntime::PreparePlayerSlots({ image });
 +				return TRUE;
 +			}
 +
@@ -323,7 +325,7 @@ index eca31da..1e78937 100644
  			// Create the client instance
  			g_pClient = new CClient();
  
-@@ -37,7 +98,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
+@@ -37,7 +99,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
  	case DLL_PROCESS_DETACH:
  		{
  			// Call the client OnUnload function

@@ -2,6 +2,7 @@
 #pragma once
 
 #include "CELocalPlayer.h"
+#include "CEPlayerSlots.h"
 #include "CESession.h"
 
 namespace ivmp_ce
@@ -12,7 +13,7 @@ class RemoteActors
     {
         std::uint32_t handle = 0;
         unsigned generation = 0;
-        ULONGLONG updatedAt = 0, nextSpawn = 0;
+        ULONGLONG updatedAt = 0, nextSpawn = 0, settleUntil = 0;
         CVector3 position;
         float heading = 0.0f;
     };
@@ -24,9 +25,7 @@ class RemoteActors
 
     static void Delete(const NativeCall& native, const EntityPools& pools, Replica& actor)
     {
-        std::uint32_t result = 0;
-        if (actor.handle && pools.ResolvePed(actor.handle))
-            native.Invoke(0x0E3B49BF, result, &actor.handle); // DELETE_CHAR
+        PlayerSlots::Instance().Release(native, pools, actor.handle);
         actor = {};
     }
 
@@ -46,20 +45,12 @@ class RemoteActors
 
     static bool Spawn(const NativeCall& native, const EntityPools& pools, Replica& actor, const Session::Remote& remote)
     {
-        std::uint32_t result = 0;
         const auto& position = remote.onFoot.vecPos;
-        if (!native.Invoke(0x4A673763, result, 1u, Niko, position.fX, position.fY, position.fZ,
-            &actor.handle, 1u) || !pools.ResolvePed(actor.handle)) // CREATE_CHAR
-        {
-            actor.handle = 0;
-            return false;
-        }
+        actor.handle = PlayerSlots::Instance().Acquire(native, pools, position.fX, position.fY, position.fZ);
+        if (!actor.handle) return false;
         actor.generation = remote.generation;
         actor.position = position;
         actor.heading = std::fmod(remote.onFoot.fHeading, 360.0f);
-        native.Invoke(0x76247429, result, actor.handle, 1u); // SET_BLOCKING_OF_NON_TEMPORARY_EVENTS
-        native.Invoke(0x20266A86, result, actor.handle, 1u); // FREEZE_CHAR_POSITION
-        OutputDebugStringW(L"IV:MP CE: created a remote Niko in GTA IV.\n");
         return true;
     }
 
@@ -75,11 +66,16 @@ class RemoteActors
         if (turn > 180.0f) turn -= 360.0f;
         if (turn < -180.0f) turn += 360.0f;
         actor.heading = std::fmod(actor.heading + turn * blend + 360.0f, 360.0f);
-        actor.updatedAt = now;
         std::uint32_t result = 0;
         native.Invoke(0x57C758F0, result, actor.handle, actor.position.fX,
             actor.position.fY, actor.position.fZ); // SET_CHAR_COORDINATES_NO_OFFSET
         native.Invoke(0x46B5523B, result, actor.handle, actor.heading); // SET_CHAR_HEADING
+        if (!actor.updatedAt)
+        {
+            native.Invoke(0x04CF0105, result, actor.handle, 1u); // SET_CHAR_VISIBLE
+            OutputDebugStringW(L"IV:MP CE: remote Niko is visible in a player slot.\n");
+        }
+        actor.updatedAt = now;
     }
 
 public:
@@ -101,15 +97,17 @@ public:
                 continue;
             }
             if (actor.handle && actor.generation != remote->generation) Delete(native, pools, actor);
-            if (!actor.handle || !pools.ResolvePed(actor.handle))
+            if (!PlayerSlots::Instance().Owns(pools, actor.handle))
             {
+                if (actor.handle) Delete(native, pools, actor);
                 actor.handle = 0;
                 if (now < actor.nextSpawn || !ModelIsReady(native, now)) continue;
                 actor.nextSpawn = now + 500;
                 if (!Spawn(native, pools, actor, *remote)) continue;
                 actor.updatedAt = 0;
+                actor.settleUntil = now + 100;
             }
-            SetPose(native, actor, remote->onFoot, now);
+            if (now >= actor.settleUntil) SetPose(native, actor, remote->onFoot, now);
         }
     }
 

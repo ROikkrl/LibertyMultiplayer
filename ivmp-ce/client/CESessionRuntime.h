@@ -138,7 +138,8 @@ class SessionRuntime
         }
         deadline = now + 10000;
         sentPosition = false;
-        renderPeers = settings.renderPeers;
+        renderPeers = settings.renderPeers && PlayerSlots::Instance().Available();
+        if (settings.renderPeers && !renderPeers) Report(L"Extra player slots are unavailable for this launch.");
         Report(L"Connecting to the IV:MP server.");
     }
 
@@ -183,6 +184,14 @@ class SessionRuntime
     }
 
 public:
+    static void PreparePlayerSlots(const Engine& engine)
+    {
+        const auto& path = Instance().settingsPath;
+        if (!path.empty() && GetPrivateProfileIntW(L"session", L"render_peers", 0, path.c_str()) == 1 &&
+            !PlayerSlots::Instance().Install(engine))
+            Report(L"Extra player slots did not match the Complete Edition profile.");
+    }
+
     static SessionRuntime& Instance()
     {
         // The ASI is pinned, and process exit tears down RakNet with the game.
