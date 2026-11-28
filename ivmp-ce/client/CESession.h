@@ -6,6 +6,7 @@
 #include <Network/PacketIdentifiers.h>
 #include <array>
 #include <cmath>
+#include "CEVehicleState.h"
 
 namespace ivmp_ce
 {
@@ -30,6 +31,7 @@ private:
     unsigned fileLists = 0;
     const wchar_t* status = L"";
     std::array<Remote, MAX_PLAYERS> remotes{};
+    VehicleRegistry vehicles;
 
     void Fail(const wchar_t* reason)
     {
@@ -82,8 +84,23 @@ private:
             return;
         }
         if (state != State::Authorizing && state != State::Joined) return;
+        if (vehicles.Handle(rpc, data)) return;
 
         EntityId id;
+        if (rpc == RPC_InVehicleSync)
+        {
+            EntityId vehicleId;
+            unsigned short ping;
+            bool helmet;
+            InVehicleSyncData frame{};
+            if (!data.ReadCompressed(id) || !data.ReadCompressed(vehicleId) || id >= MAX_PLAYERS ||
+                id == localId || !remotes[id].present || !data.ReadCompressed(ping) ||
+                !data.GetNumberOfUnreadBits() || !data.ReadCompressed(helmet) ||
+                !data.Read(reinterpret_cast<char*>(&frame), sizeof(frame))) return;
+            auto* vehicle = vehicles.Find(vehicleId);
+            if (vehicle && vehicle->ApplyDriver(frame)) remotes[id].hasPosition = false;
+            return;
+        }
         if (rpc != RPC_NewPlayer && rpc != RPC_DeletePlayer && rpc != RPC_OnFootSync) return;
         if (!data.ReadCompressed(id) || id >= MAX_PLAYERS || id == localId) return;
         auto& remote = remotes[id];
@@ -126,6 +143,7 @@ public:
         fileLists = 0;
         status = L"";
         remotes = {};
+        vehicles.Clear();
     }
 
     void Reset()
@@ -136,6 +154,7 @@ public:
         fileLists = 0;
         status = L"";
         remotes = {};
+        vehicles.Clear();
     }
 
     void Handle(CPacket& packet)
@@ -197,5 +216,6 @@ public:
     const wchar_t* Status() const { return status; }
     EntityId LocalId() const { return localId; }
     const Remote* GetRemote(EntityId id) const { return id < MAX_PLAYERS ? &remotes[id] : nullptr; }
+    const VehicleRegistry& Vehicles() const { return vehicles; }
 };
 }

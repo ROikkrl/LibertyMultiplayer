@@ -3,6 +3,7 @@
 
 #include "CELocalPlayer.h"
 #include "CERemoteActors.h"
+#include "CERemoteVehicles.h"
 #include "CESession.h"
 #include <Network/CNetworkModule.h>
 #include <cwchar>
@@ -18,6 +19,7 @@ class SessionRuntime
         unsigned short port = 0;
         bool autoConnect = false;
         bool renderPeers = false;
+        bool renderVehicles = false;
     };
 
     std::wstring settingsPath, networkPath;
@@ -26,8 +28,10 @@ class SessionRuntime
     CNetClientInterface* peer = nullptr;
     Session session;
     RemoteActors actors;
+    RemoteVehicles vehicles;
     ULONGLONG deadline = 0, nextSync = 0;
     bool f9Down = false, autoAttempted = false, sentPosition = false, renderPeers = false;
+    bool renderVehicles = false;
 
     static void Report(const wchar_t* message)
     {
@@ -62,6 +66,7 @@ class SessionRuntime
         settings.port = static_cast<unsigned short>(port);
         settings.autoConnect = GetPrivateProfileIntW(L"session", L"auto_connect", 0, settingsPath.c_str()) == 1;
         settings.renderPeers = GetPrivateProfileIntW(L"session", L"render_peers", 0, settingsPath.c_str()) == 1;
+        settings.renderVehicles = GetPrivateProfileIntW(L"session", L"render_vehicles", 0, settingsPath.c_str()) == 1;
         return settings;
     }
 
@@ -93,6 +98,7 @@ class SessionRuntime
         }
         destroy = nullptr;
         renderPeers = false;
+        renderVehicles = false;
     }
 
     void Start(const Settings& settings, ULONGLONG now)
@@ -139,6 +145,7 @@ class SessionRuntime
         deadline = now + 10000;
         sentPosition = false;
         renderPeers = settings.renderPeers && PlayerSlots::Instance().Available();
+        renderVehicles = settings.renderVehicles;
         if (settings.renderPeers && !renderPeers) Report(L"Extra player slots are unavailable for this launch.");
         Report(L"Connecting to the IV:MP server.");
     }
@@ -152,9 +159,11 @@ class SessionRuntime
         if (!reader.Read(player) || player.episode != 0)
         {
             actors.Clear(engine);
+            vehicles.Clear(engine);
             return;
         }
         if (renderPeers) actors.Tick(engine, session, player, now);
+        if (renderVehicles) vehicles.Tick(engine, session.Vehicles(), player, now);
         OnFootMotion motion;
         if (!reader.ReadOnFoot(player, motion)) return;
         OnFootSyncData data{};
@@ -214,6 +223,7 @@ public:
         {
             Report(L"Disconnected from the IV:MP server.");
             actors.Clear(engine);
+            vehicles.Clear(engine);
             Stop();
             return;
         }
@@ -228,6 +238,7 @@ public:
         {
             Report(state == Session::State::Failed ? session.Status() : L"The IV:MP connection timed out.");
             actors.Clear(engine);
+            vehicles.Clear(engine);
             Stop();
         }
     }
