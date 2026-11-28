@@ -20,7 +20,21 @@ public:
         bool hasPosition = false;
         unsigned generation = 0;
         ULONGLONG receivedAt = 0;
+        EntityId vehicle = INVALID_ENTITY_ID;
+        unsigned char seat = 0;
         OnFootSyncData onFoot{};
+    };
+    struct EntryReply
+    {
+        bool pending = false, accepted = false;
+        EntityId vehicle = INVALID_ENTITY_ID;
+        unsigned char seat = 0;
+    };
+    struct Relocation
+    {
+        bool pending = false, hasHeading = false;
+        CVector3 position;
+        float heading = 0.0f;
     };
 
 private:
@@ -32,6 +46,9 @@ private:
     const wchar_t* status = L"";
     std::array<Remote, MAX_PLAYERS> remotes{};
     VehicleRegistry vehicles;
+    EntryReply entryReply;
+    Relocation spawn, relocation;
+    EntryReply seatCommand;
 
     void Fail(const wchar_t* reason)
     {
@@ -85,20 +102,77 @@ private:
         }
         if (state != State::Authorizing && state != State::Joined) return;
         if (vehicles.Handle(rpc, data)) return;
+        if (rpc == RPC_ScriptingWarpPlayerIntoVehicle)
+        {
+            EntityId vehicle;
+            unsigned char seat;
+            if (data.Read(vehicle) && vehicle < MAX_VEHICLES && data.Read(seat) &&
+                seat <= MAX_VEHICLE_PASSENGERS)
+                seatCommand = {true, true, vehicle, seat};
+            return;
+        }
+        if (rpc == RPC_ScriptingRemovePlayerFromVehicle)
+        {
+            if (data.GetNumberOfUnreadBits())
+                seatCommand = {true, data.ReadBit(), INVALID_ENTITY_ID, 0};
+            return;
+        }
+        if (rpc == RPC_ScriptingSetPlayerCoordinates || rpc == RPC_ScriptingSetSpawnLocation)
+        {
+            Relocation move;
+            move.hasHeading = rpc == RPC_ScriptingSetSpawnLocation;
+            if (!data.Read(move.position) || !Finite(move.position) ||
+                std::fabs(move.position.fX) > 10000.0f || std::fabs(move.position.fY) > 10000.0f ||
+                std::fabs(move.position.fZ) > 2000.0f ||
+                (move.hasHeading && (!data.Read(move.heading) || !std::isfinite(move.heading)))) return;
+            move.pending = true;
+            (move.hasHeading ? spawn : relocation) = move;
+            return;
+        }
 
         EntityId id;
-        if (rpc == RPC_InVehicleSync)
+        if (rpc == RPC_VehicleEnterExit)
+        {
+            if (!data.ReadCompressed(id) || id != localId || !data.GetNumberOfUnreadBits()) return;
+            if (!data.ReadBit())
+            {
+                entryReply = {true, false, INVALID_ENTITY_ID, 0};
+                return;
+            }
+            unsigned char action, seat;
+            EntityId vehicle;
+            if (data.Read(action) && action == VEHICLE_ENTRY_RETURN && data.Read(vehicle) && data.Read(seat))
+                entryReply = {true, true, vehicle, seat};
+            return;
+        }
+        if (rpc == RPC_InVehicleSync || rpc == RPC_PassengerSync)
         {
             EntityId vehicleId;
             unsigned short ping;
             bool helmet;
-            InVehicleSyncData frame{};
             if (!data.ReadCompressed(id) || !data.ReadCompressed(vehicleId) || id >= MAX_PLAYERS ||
                 id == localId || !remotes[id].present || !data.ReadCompressed(ping) ||
-                !data.GetNumberOfUnreadBits() || !data.ReadCompressed(helmet) ||
-                !data.Read(reinterpret_cast<char*>(&frame), sizeof(frame))) return;
+                !data.GetNumberOfUnreadBits() || !data.ReadCompressed(helmet)) return;
             auto* vehicle = vehicles.Find(vehicleId);
-            if (vehicle && vehicle->ApplyDriver(frame)) remotes[id].hasPosition = false;
+            if (!vehicle) return;
+            unsigned char seat = 0;
+            if (rpc == RPC_InVehicleSync)
+            {
+                InVehicleSyncData frame{};
+                if (!data.Read(reinterpret_cast<char*>(&frame), sizeof(frame)) || !vehicle->ApplyDriver(frame)) return;
+            }
+            else
+            {
+                PassengerSyncData frame{};
+                if (!data.Read(reinterpret_cast<char*>(&frame), sizeof(frame)) ||
+                    frame.byteSeatId == 0 || frame.byteSeatId > MAX_VEHICLE_PASSENGERS) return;
+                seat = frame.byteSeatId;
+            }
+            auto& remote = remotes[id];
+            remote.vehicle = vehicleId;
+            remote.seat = seat;
+            remote.hasPosition = false;
+            remote.receivedAt = GetTickCount64();
             return;
         }
         if (rpc != RPC_NewPlayer && rpc != RPC_DeletePlayer && rpc != RPC_OnFootSync) return;
@@ -116,6 +190,7 @@ private:
         {
             remote.present = false;
             remote.hasPosition = false;
+            remote.vehicle = INVALID_ENTITY_ID;
         }
         else if (remote.present)
         {
@@ -128,6 +203,7 @@ private:
             {
                 remote.onFoot = frame;
                 remote.hasPosition = true;
+                remote.vehicle = INVALID_ENTITY_ID;
                 remote.receivedAt = GetTickCount64();
             }
         }
@@ -144,6 +220,10 @@ public:
         status = L"";
         remotes = {};
         vehicles.Clear();
+        entryReply = {};
+        seatCommand = {};
+        spawn = {};
+        relocation = {};
     }
 
     void Reset()
@@ -155,6 +235,10 @@ public:
         status = L"";
         remotes = {};
         vehicles.Clear();
+        entryReply = {};
+        seatCommand = {};
+        spawn = {};
+        relocation = {};
     }
 
     void Handle(CPacket& packet)
@@ -210,6 +294,58 @@ public:
         data.Write(reinterpret_cast<const char*>(&frame), sizeof(frame));
         data.Write0();
         return peer->RPC(RPC_OnFootSync, &data, PRIORITY_LOW, RELIABILITY_UNRELIABLE_SEQUENCED) != 0;
+    }
+
+    bool VehicleTransition(eVehicleEntryExit action, EntityId vehicle, unsigned char seat)
+    {
+        if (state != State::Joined || vehicle == INVALID_ENTITY_ID) return false;
+        CBitStream packet;
+        packet.WriteCompressed(localId);
+        packet.Write(static_cast<unsigned char>(action));
+        packet.WriteCompressed(vehicle);
+        if (action == VEHICLE_ENTRY_REQUEST || action == VEHICLE_ENTRY_COMPLETE || action == VEHICLE_ENTRY_CANCELLED)
+            packet.Write(seat);
+        return Send(RPC_VehicleEnterExit, &packet);
+    }
+
+    EntryReply TakeEntryReply()
+    {
+        const auto reply = entryReply;
+        entryReply = {};
+        return reply;
+    }
+
+    EntryReply TakeSeatCommand()
+    {
+        const auto command = seatCommand;
+        seatCommand = {};
+        return command;
+    }
+
+    Relocation TakeRelocation(bool useSpawn)
+    {
+        const auto move = relocation.pending || !useSpawn ? relocation : spawn;
+        spawn = {};
+        relocation = {};
+        return move;
+    }
+
+    template<class Payload>
+    bool SendVehicle(RPCIdentifier rpc, EntityId vehicle, const Payload& frame)
+    {
+        if (state != State::Joined || vehicle == INVALID_ENTITY_ID) return false;
+        CBitStream packet;
+        packet.WriteCompressed(vehicle);
+        packet.Write(reinterpret_cast<const char*>(&frame), sizeof(frame));
+        packet.Write0();
+        return peer->RPC(rpc, &packet, PRIORITY_LOW, RELIABILITY_UNRELIABLE_SEQUENCED) != 0;
+    }
+
+    bool SendDriver(EntityId vehicle, const InVehicleSyncData& frame)
+    {
+        auto* state = vehicles.Find(vehicle);
+        if (!state || !state->ApplyDriver(frame)) return false;
+        return SendVehicle(RPC_InVehicleSync, vehicle, frame);
     }
 
     State GetState() const { return state; }

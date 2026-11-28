@@ -4,6 +4,7 @@
 #include "CELocalPlayer.h"
 #include "CEPlayerSlots.h"
 #include "CESession.h"
+#include "CERemoteVehicles.h"
 
 namespace ivmp_ce
 {
@@ -12,6 +13,8 @@ class RemoteActors
     struct Replica
     {
         std::uint32_t handle = 0;
+        std::uint32_t vehicle = 0;
+        unsigned char seat = 0;
         unsigned generation = 0;
         ULONGLONG updatedAt = 0, nextSpawn = 0, settleUntil = 0;
         CVector3 position;
@@ -23,8 +26,18 @@ class RemoteActors
     ULONGLONG nextModelRequest = 0;
     bool requestedModel = false;
 
+    static void LeaveSeat(const NativeCall& native, Replica& actor, const CVector3& position)
+    {
+        std::uint32_t result = 0;
+        if (native.Invoke(0x71184DA3, result, actor.handle) && result)
+            native.Invoke(0x6A77506A, result, actor.handle, position.fX, position.fY, position.fZ);
+        actor.vehicle = 0;
+    }
+
     static void Delete(const NativeCall& native, const EntityPools& pools, Replica& actor)
     {
+        if (actor.vehicle && PlayerSlots::Instance().Owns(pools, actor.handle))
+            LeaveSeat(native, actor, actor.position + CVector3(2.0f, 0.0f, 0.0f));
         PlayerSlots::Instance().Release(native, pools, actor.handle);
         actor = {};
     }
@@ -78,8 +91,41 @@ class RemoteActors
         actor.updatedAt = now;
     }
 
+    static void SetSeat(const NativeCall& native, Replica& actor, std::uint32_t car, unsigned char seat,
+                        const CVector3& position)
+    {
+        actor.position = position;
+        if (actor.vehicle == car && actor.seat == seat) return;
+        std::uint32_t result = 0, occupant = 0;
+        if (seat)
+        {
+            std::uint32_t capacity = 0;
+            if (!native.Invoke(0x554014F1, result, car, &capacity) || seat > capacity ||
+                !native.Invoke(0x5E756B51, result, car, unsigned(seat - 1), &occupant)) return;
+        }
+        else
+        {
+            if (!native.Invoke(0x22457083, result, car, &occupant)) return;
+        }
+        if (occupant && occupant != actor.handle) return;
+        native.Invoke(0x20266A86, result, actor.handle, 0u); // FREEZE_CHAR_POSITION
+        const bool warped = seat ? native.Invoke(0x172376FE, result, actor.handle, car, unsigned(seat - 1))
+            : native.Invoke(0x73D3504A, result, actor.handle, car);
+        std::uint32_t actualCar = 0;
+        if (!warped || !native.Invoke(0x71184DA3, result, actor.handle) || !result ||
+            !native.Invoke(0x1B067237, result, actor.handle, &actualCar) || actualCar != car)
+        {
+            native.Invoke(0x20266A86, result, actor.handle, 1u);
+            return;
+        }
+        native.Invoke(0x04CF0105, result, actor.handle, 1u); // SET_CHAR_VISIBLE
+        actor.vehicle = car;
+        actor.seat = seat;
+    }
+
 public:
-    void Tick(const Engine& engine, const Session& session, const LocalPlayer& player, ULONGLONG now)
+    void Tick(const Engine& engine, const Session& session, const RemoteVehicles& vehicles,
+              const LocalPlayer& player, ULONGLONG now)
     {
         const auto pools = engine.Pools();
         if (!pools || !*pools.peds) return;
@@ -88,26 +134,51 @@ public:
         for (EntityId id = 0; id < MAX_PLAYERS; ++id)
         {
             auto& actor = actors[id];
-            const auto remote = session.GetRemote(id);
-            if (!remote->present || !remote->hasPosition ||
-                (now >= remote->receivedAt && now - remote->receivedAt > 3000) ||
-                (remote->onFoot.vecPos - local).Length() > 160.0f)
+            auto remote = *session.GetRemote(id);
+            const auto car = vehicles.HandleOf(remote.vehicle);
+            if (car)
+            {
+                const auto& entries = session.Vehicles().Entries();
+                const auto found = entries.find(remote.vehicle);
+                if (found != entries.end())
+                {
+                    remote.onFoot.vecPos = found->second.position;
+                    remote.onFoot.fHeading = found->second.rotation.fZ;
+                    remote.hasPosition = true;
+                }
+            }
+            if (!remote.present || !remote.hasPosition ||
+                (now >= remote.receivedAt && now - remote.receivedAt > 3000) ||
+                (remote.onFoot.vecPos - local).Length() > 160.0f)
             {
                 if (actor.handle) Delete(native, pools, actor);
                 continue;
             }
-            if (actor.handle && actor.generation != remote->generation) Delete(native, pools, actor);
+            if (actor.handle && actor.generation != remote.generation) Delete(native, pools, actor);
             if (!PlayerSlots::Instance().Owns(pools, actor.handle))
             {
                 if (actor.handle) Delete(native, pools, actor);
                 actor.handle = 0;
                 if (now < actor.nextSpawn || !ModelIsReady(native, now)) continue;
                 actor.nextSpawn = now + 500;
-                if (!Spawn(native, pools, actor, *remote)) continue;
+                if (!Spawn(native, pools, actor, remote)) continue;
                 actor.updatedAt = 0;
                 actor.settleUntil = now + 100;
             }
-            if (now >= actor.settleUntil) SetPose(native, actor, remote->onFoot, now);
+            if (now < actor.settleUntil) continue;
+            if (car)
+                SetSeat(native, actor, car, remote.seat, remote.onFoot.vecPos);
+            else
+            {
+                if (actor.vehicle)
+                {
+                    std::uint32_t result = 0;
+                    LeaveSeat(native, actor, remote.onFoot.vecPos);
+                    native.Invoke(0x20266A86, result, actor.handle, 1u);
+                    actor.updatedAt = 0;
+                }
+                SetPose(native, actor, remote.onFoot, now);
+            }
         }
     }
 

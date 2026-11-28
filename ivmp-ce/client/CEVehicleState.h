@@ -13,6 +13,8 @@ struct VehicleState
 {
     int model = -1;
     unsigned generation = 0, revision = 0, health = 0;
+    unsigned hornDuration = 0, hornRevision = 0;
+    ULONGLONG hornAt = 0;
     float petrol = 0.0f, dirt = 0.0f;
     CVector3 position, rotation, movement, spin;
     unsigned char colours[4]{};
@@ -51,6 +53,7 @@ struct VehicleState
         packet.IgnoreBits(13); // Four indicators and nine component flags.
         if (!packet.Read(hornDuration) || !ReadFlag(packet, vehicle.siren) || !packet.Read(lockState) ||
             !ReadFlag(packet, vehicle.engine) || !ReadFlag(packet, vehicle.lights)) return false;
+        if (hornDuration > 0) vehicle.SoundHorn(static_cast<unsigned>(hornDuration));
         for (unsigned i = 0; i != 6; ++i)
         {
             float angle;
@@ -69,6 +72,13 @@ struct VehicleState
         }
         state = vehicle;
         return true;
+    }
+
+    void SoundHorn(unsigned duration)
+    {
+        hornDuration = duration > 5000 ? 5000 : duration;
+        hornAt = GetTickCount64();
+        ++hornRevision;
     }
 
     bool ApplyDriver(const InVehicleSyncData& frame)
@@ -110,6 +120,8 @@ public:
         case RPC_ScriptingSetVehicleRotation:
         case RPC_ScriptingSetVehicleColor:
         case RPC_ScriptingSetVehicleHealth:
+        case RPC_ScriptingSetCarLights:
+        case RPC_ScriptingSoundVehicleHorn:
             break;
         default: return false;
         }
@@ -143,6 +155,16 @@ public:
             unsigned char colours[4];
             if (!packet.Read(reinterpret_cast<char*>(colours), sizeof(colours))) return true;
             for (unsigned i = 0; i != 4; ++i) vehicle->colours[i] = colours[i];
+        }
+        else if (rpc == RPC_ScriptingSetCarLights)
+        {
+            if (!VehicleState::ReadFlag(packet, vehicle->lights)) return true;
+        }
+        else if (rpc == RPC_ScriptingSoundVehicleHorn)
+        {
+            unsigned duration = 0;
+            if (packet.Read(duration)) vehicle->SoundHorn(duration);
+            return true;
         }
         else
         {

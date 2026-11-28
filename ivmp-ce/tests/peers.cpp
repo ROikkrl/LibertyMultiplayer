@@ -108,6 +108,17 @@ int main(int argc, char** argv)
     if (synced && testVehicles && !cars.empty())
     {
         const auto id = cars.begin()->first;
+        const auto connectSeat = [&](Session& session, unsigned char seat) {
+            if (!session.VehicleTransition(VEHICLE_ENTRY_REQUEST, id, seat)) return false;
+            return Wait([&] {
+                pump();
+                const auto reply = session.TakeEntryReply();
+                return reply.pending && reply.accepted && reply.vehicle == id && reply.seat == seat &&
+                    session.VehicleTransition(VEHICLE_ENTRY_COMPLETE, id, seat);
+            });
+        };
+        const bool entered = connectSeat(sessions[0], 0) && connectSeat(sessions[1], 1);
+        if (!entered) std::fputs("IV:MP did not grant both vehicle seats.\n", stderr);
         const auto& initial = cars.begin()->second;
         InVehicleSyncData car{};
         car.vecPos = initial.position + CVector3(3.0f, 0.0f, 2.0f);
@@ -118,12 +129,11 @@ int main(int argc, char** argv)
         car.byteColors[3] = 77;
         car.bLights = true;
         car.bSirenState = true;
-        vehiclesSynced = Wait([&] {
-            CBitStream packet;
-            packet.WriteCompressed(id);
-            packet.Write(reinterpret_cast<const char*>(&car), sizeof(car));
-            packet.Write0();
-            first->RPC(RPC_InVehicleSync, &packet, PRIORITY_LOW, RELIABILITY_UNRELIABLE_SEQUENCED);
+        PassengerSyncData passenger{};
+        passenger.byteSeatId = 1;
+        vehiclesSynced = entered && Wait([&] {
+            sessions[0].SendDriver(id, car);
+            sessions[1].SendVehicle(RPC_PassengerSync, id, passenger);
             pump();
             const auto& received = sessions[1].Vehicles().Entries();
             const auto found = received.find(id);
@@ -132,8 +142,27 @@ int main(int argc, char** argv)
             return state.model == initial.model && state.revision && state.position.fX == car.vecPos.fX &&
                 state.rotation.fY == car.vecRotation.fY && state.health == car.uiHealth &&
                 state.colours[0] == 12 && state.colours[3] == 77 && state.lights && state.siren &&
-                !sessions[1].GetRemote(sessions[0].LocalId())->hasPosition;
+                sessions[1].GetRemote(sessions[0].LocalId())->vehicle == id &&
+                sessions[0].GetRemote(sessions[1].LocalId())->vehicle == id &&
+                sessions[0].GetRemote(sessions[1].LocalId())->seat == 1;
         });
+        if (vehiclesSynced)
+        {
+            sessions[1].VehicleTransition(VEHICLE_EXIT_COMPLETE, id, 1);
+            vehiclesSynced = Wait([&] {
+                sessions[1].SendOnFoot(reply);
+                pump();
+                const auto* remote = sessions[0].GetRemote(sessions[1].LocalId());
+                return remote->hasPosition && remote->vehicle == INVALID_ENTITY_ID;
+            });
+        }
+        if (entered && !vehiclesSynced)
+        {
+            const auto* passengerState = sessions[0].GetRemote(sessions[1].LocalId());
+            const auto* driverState = sessions[1].GetRemote(sessions[0].LocalId());
+            std::fprintf(stderr, "Last seat packets: driver vehicle %u, passenger vehicle %u, seat %u.\n",
+                         unsigned(driverState->vehicle), unsigned(passengerState->vehicle), unsigned(passengerState->seat));
+        }
     }
     bool removed = false;
     if (synced && vehiclesSynced)
@@ -143,6 +172,21 @@ int main(int argc, char** argv)
         {
             second->Process();
             return !sessions[1].GetRemote(sessions[0].LocalId())->present;
+        });
+    }
+    bool rejoined = false;
+    if (removed)
+    {
+        destroy(first);
+        first = create();
+        reply.vecPos.fY = 110.0f;
+        rejoined = first && Connect(*first, sessions[0], "PortAlpha", serverPort, HandleFirst) && Wait([&]
+        {
+            pump();
+            if (sessions[0].GetState() != Session::State::Joined) return false;
+            sessions[0].SendOnFoot(reply);
+            const auto* remote = sessions[1].GetRemote(sessions[0].LocalId());
+            return remote && remote->present && remote->hasPosition && remote->onFoot.vecPos.fY == reply.vecPos.fY;
         });
     }
 
@@ -158,7 +202,8 @@ int main(int argc, char** argv)
     else if (!synced) std::fputs("A local IV:MP client did not receive the other player's on-foot update.\n", stderr);
     else if (!vehiclesSynced) std::fputs("A local IV:MP client did not receive the server vehicle and driver update.\n", stderr);
     else if (!removed) std::fputs("A disconnected IV:MP player remained in the remote session.\n", stderr);
-    else std::puts(testVehicles ? "Two IV:MP clients joined, relayed on-foot and vehicle state, and handled disconnect."
-                               : "Two IV:MP clients joined, relayed on-foot motion and removed the disconnected peer.");
-    return removed ? 0 : 1;
+    else if (!rejoined) std::fputs("A player could not rejoin while the other client remained connected.\n", stderr);
+    else std::puts(testVehicles ? "Two IV:MP clients relayed on-foot and vehicle state, then disconnected and rejoined."
+                               : "Two IV:MP clients relayed on-foot motion, then disconnected and rejoined.");
+    return rejoined ? 0 : 1;
 }

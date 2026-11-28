@@ -124,10 +124,10 @@ index 207cab5..42a690a 100644
      m_pPedPool = new CIVPool<IVPed>(*(IVPool **)COffsets::VAR_PedPool);
      m_pVehiclePool = new CIVPool<IVVehicle>(*(IVPool **)COffsets::VAR_VehiclePool);
 diff --git a/Client/Core/Client.Core.vcxproj b/Client/Core/Client.Core.vcxproj
-index 775d25e..8113ed2 100644
+index 775d25e..2d6c7b3 100644
 --- a/Client/Core/Client.Core.vcxproj
 +++ b/Client/Core/Client.Core.vcxproj
-@@ -161,6 +161,17 @@
+@@ -161,6 +161,18 @@
      <ClInclude Include="CGameFileChecker.h" />
      <ClInclude Include="CModelManager.h" />
      <ClInclude Include="COffsets.h" />
@@ -140,6 +140,7 @@ index 775d25e..8113ed2 100644
 +    <ClInclude Include="CompleteEdition\CEPlayerSlots.h" />
 +    <ClInclude Include="CompleteEdition\CEVehicleState.h" />
 +    <ClInclude Include="CompleteEdition\CERemoteVehicles.h" />
++    <ClInclude Include="CompleteEdition\CEVehicleControl.h" />
 +    <ClInclude Include="CompleteEdition\CESession.h" />
 +    <ClInclude Include="CompleteEdition\CESessionRuntime.h" />
      <ClInclude Include="CPools.h" />
@@ -429,6 +430,33 @@ index 22586b7..b22d22d 100644
  	}
  }
  
+diff --git a/Network/Core/CNetServer.cpp b/Network/Core/CNetServer.cpp
+index 6d47327..4fa508d 100644
+--- a/Network/Core/CNetServer.cpp
++++ b/Network/Core/CNetServer.cpp
+@@ -287,18 +287,13 @@ void CNetServer::DeallocatePacket(CPacket * pPacket)
+ 		// Get the player socket
+ 		CPlayerSocket * pPlayerSocket = pPacket->pPlayerSocket;
+ 
+-		// Delete the player socket
++		// Remove the socket before SAFE_DELETE clears the pointer.
++		m_playerSocketList.remove(pPlayerSocket);
+ 		SAFE_DELETE(pPlayerSocket);
+-
+-		// Remove the player socket from the player socket list
+-		if(m_playerSocketList.size() == 1)
+-			m_playerSocketList.clear();
+-		else
+-			m_playerSocketList.remove(pPlayerSocket);
+ 	}
+ 
+-	// Delete the packet data
+-	SAFE_DELETE(pPacket->ucData);
++	// Receive allocated the packet data as an array.
++	SAFE_DELETE_ARRAY(pPacket->ucData);
+ 
+ 	// Delete the packet
+ 	SAFE_DELETE(pPacket);
 diff --git a/Shared/CEvents.h b/Shared/CEvents.h
 index 6e9026a..61086d7 100644
 --- a/Shared/CEvents.h

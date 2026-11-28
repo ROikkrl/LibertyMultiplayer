@@ -4,6 +4,7 @@
 #include "CELocalPlayer.h"
 #include "CERemoteActors.h"
 #include "CERemoteVehicles.h"
+#include "CEVehicleControl.h"
 #include "CESession.h"
 #include <Network/CNetworkModule.h>
 #include <cwchar>
@@ -20,6 +21,7 @@ class SessionRuntime
         bool autoConnect = false;
         bool renderPeers = false;
         bool renderVehicles = false;
+        bool serverSpawn = false;
     };
 
     std::wstring settingsPath, networkPath;
@@ -29,9 +31,12 @@ class SessionRuntime
     Session session;
     RemoteActors actors;
     RemoteVehicles vehicles;
+    VehicleControl vehicleControl;
     ULONGLONG deadline = 0, nextSync = 0;
     bool f9Down = false, autoAttempted = false, sentPosition = false, renderPeers = false;
-    bool renderVehicles = false;
+    bool renderVehicles = false, serverSpawn = false;
+    bool spawnApplied = false;
+    bool passengerDown = false;
 
     static void Report(const wchar_t* message)
     {
@@ -67,6 +72,7 @@ class SessionRuntime
         settings.autoConnect = GetPrivateProfileIntW(L"session", L"auto_connect", 0, settingsPath.c_str()) == 1;
         settings.renderPeers = GetPrivateProfileIntW(L"session", L"render_peers", 0, settingsPath.c_str()) == 1;
         settings.renderVehicles = GetPrivateProfileIntW(L"session", L"render_vehicles", 0, settingsPath.c_str()) == 1;
+        settings.serverSpawn = GetPrivateProfileIntW(L"session", L"server_spawn", 0, settingsPath.c_str()) == 1;
         return settings;
     }
 
@@ -144,8 +150,10 @@ class SessionRuntime
         }
         deadline = now + 10000;
         sentPosition = false;
+        spawnApplied = false;
         renderPeers = settings.renderPeers && PlayerSlots::Instance().Available();
         renderVehicles = settings.renderVehicles;
+        serverSpawn = settings.serverSpawn;
         if (settings.renderPeers && !renderPeers) Report(L"Extra player slots are unavailable for this launch.");
         Report(L"Connecting to the IV:MP server.");
     }
@@ -158,12 +166,36 @@ class SessionRuntime
         LocalPlayer player;
         if (!reader.Read(player) || player.episode != 0)
         {
-            actors.Clear(engine);
-            vehicles.Clear(engine);
+            ClearWorld(engine);
             return;
         }
-        if (renderPeers) actors.Tick(engine, session, player, now);
-        if (renderVehicles) vehicles.Tick(engine, session.Vehicles(), player, now);
+        const auto move = session.TakeRelocation(serverSpawn && !spawnApplied);
+        if (move.pending)
+        {
+            const NativeCall native(engine);
+            const auto& at = move.position;
+            std::uint32_t result = 0;
+            native.Invoke(0x12ED0BC9, result, at.fX, at.fY, at.fZ); // REQUEST_COLLISION_AT_POSN
+            native.Invoke(0x39F62BFB, result, at.fX, at.fY, at.fZ); // LOAD_SCENE
+            native.Invoke(player.vehicle ? 0x6A77506A : 0x57C758F0, result, player.ped, at.fX, at.fY, at.fZ);
+            if (move.hasHeading)
+            {
+                native.Invoke(0x46B5523B, result, player.ped, std::fmod(move.heading, 360.0f));
+                spawnApplied = true;
+            }
+            return;
+        }
+        if (renderVehicles)
+        {
+            vehicles.Tick(engine, session.Vehicles(), player, now);
+            vehicleControl.Tick(engine, player, session, vehicles, now);
+            vehicleControl.ApplyCommand(engine, player, session, vehicles, now);
+            const bool down = (GetAsyncKeyState('G') & 0x8000) != 0;
+            if (down && !passengerDown && IsGameForeground())
+                vehicleControl.EnterNearestPassengerSeat(engine, player, session, vehicles);
+            passengerDown = down;
+        }
+        if (renderPeers) actors.Tick(engine, session, vehicles, player, now);
         OnFootMotion motion;
         if (!reader.ReadOnFoot(player, motion)) return;
         OnFootSyncData data{};
@@ -177,6 +209,20 @@ class SessionRuntime
             sentPosition = true;
             Report(L"Sent the first on-foot update from GTA IV.");
         }
+    }
+
+    void ClearWorld(const Engine& engine)
+    {
+        LocalPlayer player;
+        if (renderVehicles && LocalPlayerReader(engine).Read(player) &&
+            vehicles.IdOf(player.vehicle) != INVALID_ENTITY_ID)
+        {
+            std::uint32_t result = 0;
+            NativeCall(engine).Invoke(0x6A77506A, result, player.ped, player.x + 2.0f, player.y, player.z);
+        }
+        vehicleControl.Clear(engine, session, vehicles);
+        actors.Clear(engine);
+        vehicles.Clear(engine);
     }
 
     SessionRuntime()
@@ -222,8 +268,7 @@ public:
         if (toggle && peer)
         {
             Report(L"Disconnected from the IV:MP server.");
-            actors.Clear(engine);
-            vehicles.Clear(engine);
+            ClearWorld(engine);
             Stop();
             return;
         }
@@ -237,8 +282,7 @@ public:
         else if (state == Session::State::Failed || now >= deadline)
         {
             Report(state == Session::State::Failed ? session.Status() : L"The IV:MP connection timed out.");
-            actors.Clear(engine);
-            vehicles.Clear(engine);
+            ClearWorld(engine);
             Stop();
         }
     }
